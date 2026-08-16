@@ -45,6 +45,24 @@ test('concurrency is per user: admin at the ceiling, new users at 1', async () =
   assert.equal(auth.updateUser('nobody', { concurrency: 2 }).ok, false);
 });
 
+test('user api rate cannot exceed the admin ceiling', async () => {
+  const auth = createAuth({
+    password: 'admin-secret',
+    adminUsername: 'admin',
+    bindHost: '0.0.0.0',
+    file: await tempFile(),
+    getRateCeiling: () => 60,
+  });
+  auth.createUser({ username: 'eve', password: 'eve-pass' });
+  assert.equal(auth.rateLimitFor('eve'), 60);
+  assert.equal(auth.updateUser('eve', { apiRateLimit: 20 }).user.apiRateLimit, 20);
+  assert.equal(auth.rateLimitFor('eve'), 20);
+  assert.equal(auth.updateUser('eve', { apiRateLimit: 80 }).ok, false);
+  assert.equal(auth.updateUser('eve', { apiRateLimit: 0 }).ok, false);
+  assert.equal(auth.updateUser('admin', { apiRateLimit: 200 }).ok, true);
+  assert.equal(auth.rateLimitFor('admin'), 200);
+});
+
 test('public auth paths stay reachable before login', async () => {
   const auth = createAuth({ password: 'secret', bindHost: '0.0.0.0', file: await tempFile() });
   assert.equal(auth.isPublicPath('/api/meta'), true);

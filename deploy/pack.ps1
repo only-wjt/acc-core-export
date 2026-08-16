@@ -27,7 +27,8 @@ foreach ($file in @(
   'env.example',
   'start.sh',
   'hot-deploy.sh',
-  'nginx.conf.example'
+  'nginx.conf.example',
+  'openapi.md'
 )) {
   Copy-Item -Force (Join-Path $PSScriptRoot $file) (Join-Path $Stage "deploy\$file")
 }

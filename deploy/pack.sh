@@ -26,6 +26,7 @@ cp "$ROOT/deploy/Dockerfile" \
    "$ROOT/deploy/start.sh" \
    "$ROOT/deploy/hot-deploy.sh" \
    "$ROOT/deploy/nginx.conf.example" \
+   "$ROOT/deploy/openapi.md" \
    "$STAGE/deploy/"
 
 cat > "$STAGE/START.txt" <<'EOF'

@@ -265,6 +265,8 @@ SECURE_COOKIE=1
 | `MAX_CONCURRENCY` | 建议压低 | 协议层全局并发上限，默认镜像外层建议 `8`。 |
 | `PW_CF_MAX` | 建议压低 | 同时过 Cloudflare 的浏览器上下文数。 |
 | `IMAGE_TAG` | 发版/回滚 | 使用的镜像标签，默认 `latest`。 |
+| `OPENAPI_KEY` | CDK 对接时建议 | 开放 API 密钥，见 [openapi.md](./openapi.md)。 |
+| `OPENAPI_CORS` | 按需 | 默认 `*`。 |
 | `PERSIST_DIR` | 不要改 | compose 固定为 `/data`。 |
 | `CHROME_PATH` | 不要改 | compose 固定为镜像内 Chrome。 |
 

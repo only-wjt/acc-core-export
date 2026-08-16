@@ -11,14 +11,27 @@ import { createCheckManager } from './batch-check.js';
 import { createAuth } from './auth.js';
 import { createStore } from './persist.js';
 import { createAdminSettings } from './admin-settings.js';
+import { createApiKeys } from './api-keys.js';
+import { createOpenApi } from './openapi.js';
+import { getOpenApiDocs } from './openapi-spec.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT) || 3780;
 const MAX_BODY_BYTES = 1024 * 1024;
 const root = resolve(fileURLToPath(new URL('../public/', import.meta.url)));
-const auth = createAuth({ bindHost: HOST });
 const store = createStore();
 const adminSettings = createAdminSettings();
+const auth = createAuth({
+  bindHost: HOST,
+  getRateCeiling: () => adminSettings.get().apiRateLimit,
+});
+const apiKeys = createApiKeys({
+  getLimits: () => {
+    const settings = adminSettings.get();
+    return { maxKeysPerUser: settings.maxApiKeys, rateLimitPerMinute: settings.apiRateLimit };
+  },
+  getUserRateLimit: (username) => auth.rateLimitFor(username),
+});
 const jobOwners = new Map();
 const manager = createBatchManager({
   login: gpt.login,
@@ -30,6 +43,15 @@ const manager = createBatchManager({
 const checkManager = createCheckManager({
   checkAlive: gpt.checkAlive,
   onFinish: (job) => store.saveJob('check', job, { owner: jobOwners.get(job.id) || 'local' }),
+});
+const openApi = createOpenApi({
+  apiKeys,
+  manager,
+  checkManager,
+  jobOwners,
+  adminSettings,
+  gpt,
+  mail,
 });
 
 const contentTypes = {
@@ -171,15 +193,21 @@ function handleJobRoutes(kind, req, url, res, body) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (!validHost(req)) {
+  const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+  const isOpenApi = url.pathname.startsWith('/openapi/');
+  if (!isOpenApi && !validHost(req)) {
     json(res, 403, { error: '仅允许本机或 ALLOWED_HOSTS 访问' });
     return;
   }
 
-  const url = new URL(req.url || '/', `http://${req.headers.host}`);
   try {
     const needsBody = req.method === 'POST' || req.method === 'PUT';
-    const body = needsBody && url.pathname.startsWith('/api/') ? await readJson(req) : {};
+    const body = needsBody && (url.pathname.startsWith('/api/') || isOpenApi) ? await readJson(req) : {};
+
+    if (isOpenApi) {
+      await openApi.handle(req, res, url, body);
+      return;
+    }
 
     if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/health')) {
       json(res, 200, { ok: true });
@@ -190,6 +218,7 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, {
         authRequired: auth.enabled,
         persistEnabled: store.enabled,
+        openApiEnabled: apiKeys.enabled,
         host: HOST,
         port: PORT,
       });
@@ -285,7 +314,11 @@ const server = http.createServer(async (req, res) => {
         json(res, 403, { error: '仅管理员可查看用户' });
         return;
       }
-      json(res, 200, { users: auth.listUsers(), concurrencyLimit: auth.concurrencyLimit });
+      json(res, 200, {
+        users: auth.listUsers(),
+        concurrencyLimit: auth.concurrencyLimit,
+        rateLimitCeiling: adminSettings.get().apiRateLimit,
+      });
       return;
     }
 
@@ -305,7 +338,10 @@ const server = http.createServer(async (req, res) => {
         json(res, 403, { error: '仅管理员可修改用户' });
         return;
       }
-      const result = auth.updateUser(decodeURIComponent(userMatch[1]), { concurrency: body?.concurrency });
+      const result = auth.updateUser(decodeURIComponent(userMatch[1]), {
+        concurrency: body?.concurrency,
+        apiRateLimit: body?.apiRateLimit,
+      });
       json(res, result.ok ? 200 : 400, result.ok ? result.user : { error: result.error });
       return;
     }
@@ -318,6 +354,63 @@ const server = http.createServer(async (req, res) => {
       }
       const result = auth.deleteUser(decodeURIComponent(userMatch[1]), actor.username);
       json(res, result.ok ? 200 : 400, result.ok ? { ok: true } : { error: result.error });
+      return;
+    }
+
+    if (url.pathname === '/api/me' && (req.method === 'GET' || req.method === 'PUT')) {
+      const actor = auth.currentUser(req);
+      if (!actor) {
+        json(res, 401, { error: '请先登录' });
+        return;
+      }
+      if (req.method === 'GET') {
+        json(res, 200, { user: actor, rateLimitCeiling: adminSettings.get().apiRateLimit });
+        return;
+      }
+      const result = auth.updateUser(actor.username, { apiRateLimit: body?.apiRateLimit });
+      json(res, result.ok ? 200 : 400, result.ok
+        ? { user: result.user, rateLimitCeiling: adminSettings.get().apiRateLimit }
+        : { error: result.error });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/openapi/docs') {
+      json(res, 200, getOpenApiDocs(apiKeys.limits()));
+      return;
+    }
+
+    if (url.pathname === '/api/apikeys' || url.pathname.startsWith('/api/apikeys/')) {
+      const actor = auth.currentUser(req);
+      if (!actor) {
+        json(res, 401, { error: '请先登录' });
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/api/apikeys') {
+        json(res, 200, {
+          keys: apiKeys.list(actor),
+          ...apiKeys.limits(),
+          myRateLimit: actor.apiRateLimit,
+          concurrencyLimit: actor.role === 'admin' ? apiKeys.concurrencyLimit : actor.concurrency,
+        });
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/apikeys') {
+        const result = apiKeys.create({ ...body, actor });
+        json(res, result.ok ? 201 : 400, result.ok ? result : { error: result.error });
+        return;
+      }
+      const keyMatch = url.pathname.match(/^\/api\/apikeys\/([^/]+)$/);
+      if (keyMatch && req.method === 'PUT') {
+        const result = apiKeys.update(decodeURIComponent(keyMatch[1]), { concurrency: body?.concurrency }, actor);
+        json(res, result.ok ? 200 : 400, result.ok ? result.item : { error: result.error });
+        return;
+      }
+      if (keyMatch && req.method === 'DELETE') {
+        const result = apiKeys.revoke(decodeURIComponent(keyMatch[1]), actor);
+        json(res, result.ok ? 200 : 400, result.ok ? { ok: true } : { error: result.error });
+        return;
+      }
+      json(res, 405, { error: '请求方法不支持' });
       return;
     }
 

@@ -1,0 +1,123 @@
+export function getOpenApiDocs({
+  maxKeysPerUser = 3,
+  rateLimitPerMinute = 60,
+} = {}) {
+  return {
+    title: 'ACC 开放 API',
+    version: 'v1',
+    basePath: '/openapi/v1',
+    auth: {
+      header: 'Authorization: Bearer <API_Key>',
+      alternate: 'X-Api-Key: <API_Key>',
+      note: '每名用户自己创建密钥，不要共用。完整密钥只在创建时显示一次。',
+    },
+    limits: {
+      maxKeysPerUser,
+      rateLimitPerMinute,
+      jobRetention: '任务结果约保留 30 分钟，完成后请尽快拉取',
+    },
+    endpoints: [
+      {
+        id: 'health',
+        method: 'GET',
+        path: '/openapi/v1/health',
+        auth: false,
+        summary: '探活',
+        body: null,
+        response: { ok: true, authRequired: true },
+      },
+      {
+        id: 'me',
+        method: 'GET',
+        path: '/openapi/v1/me',
+        auth: true,
+        summary: '校验密钥并查看配额',
+        body: null,
+        response: { name: 'cdk-prod', owner: 'alice', concurrency: 1, rateLimitPerMinute: 60 },
+      },
+      {
+        id: 'sessions-create',
+        method: 'POST',
+        path: '/openapi/v1/sessions',
+        auth: true,
+        summary: '批量取 Session，立即返回任务 id，再轮询',
+        body: {
+          accounts: [
+            { email: 'a@mail.com', gptPassword: 'gpt密码', mailPassword: '邮箱密码' },
+          ],
+        },
+        altBody: { input: 'a@mail.com----gpt密码----邮箱密码' },
+        response: {
+          id: '任务id',
+          kind: 'session',
+          status: 'running',
+          items: [{ email: 'a@mail.com', status: 'pending', sessionJson: null }],
+        },
+      },
+      {
+        id: 'sessions-get',
+        method: 'GET',
+        path: '/openapi/v1/sessions/{id}',
+        auth: true,
+        summary: '查询取 Session 任务。status 为 completed / cancelled 时结束',
+        body: null,
+        response: {
+          id: '任务id',
+          status: 'completed',
+          items: [{ email: 'a@mail.com', status: 'success', sessionJson: '{...}' }],
+        },
+      },
+      {
+        id: 'sessions-cancel',
+        method: 'POST',
+        path: '/openapi/v1/sessions/{id}/cancel',
+        auth: true,
+        summary: '取消取 Session 任务',
+        body: null,
+        response: { id: '任务id', status: 'cancelled' },
+      },
+      {
+        id: 'checks-create',
+        method: 'POST',
+        path: '/openapi/v1/checks',
+        auth: true,
+        summary: '批量验活',
+        body: {
+          items: [{ email: 'a@mail.com', sessionToken: 'eyJ...' }],
+        },
+        response: { id: '任务id', kind: 'check', status: 'running' },
+      },
+      {
+        id: 'checks-get',
+        method: 'GET',
+        path: '/openapi/v1/checks/{id}',
+        auth: true,
+        summary: '查询验活任务',
+        body: null,
+        response: {
+          id: '任务id',
+          status: 'completed',
+          items: [{ email: 'a@mail.com', alive: true, plan: 'plus' }],
+        },
+      },
+      {
+        id: 'totp',
+        method: 'POST',
+        path: '/openapi/v1/totp',
+        auth: true,
+        summary: '本地计算 TOTP',
+        body: { totpSecret: 'BASE32SECRET' },
+        response: { code: '123456', remainingMs: 18000 },
+      },
+      {
+        id: 'mail-otp',
+        method: 'POST',
+        path: '/openapi/v1/mail/otp',
+        auth: true,
+        summary: '从邮箱取验证码。wait=true 时最多等 60 秒',
+        body: { email: 'a@mail.com', password: '邮箱密码', wait: false },
+        response: { code: '847291' },
+      },
+    ],
+  };
+}

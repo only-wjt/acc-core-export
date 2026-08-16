@@ -938,11 +938,12 @@ tbody tr:has(input[type="checkbox"]:checked):hover td { background: var(--brass-
 .pager-page { min-width: 52px; color: var(--soft-ink); font: 600 12px/1.4 var(--mono); text-align: center; }
 .nowrap-cell { white-space: nowrap; }
 
-.users-table { min-width: 560px; }
-.users-table th:nth-child(1) { width: 30%; }
-.users-table th:nth-child(2) { width: 18%; }
-.users-table th:nth-child(3) { width: 26%; }
-.users-table th:nth-child(4) { width: 26%; }
+.users-table { min-width: 640px; }
+.users-table th:nth-child(1) { width: 22%; }
+.users-table th:nth-child(2) { width: 14%; }
+.users-table th:nth-child(3) { width: 20%; }
+.users-table th:nth-child(4) { width: 24%; }
+.users-table th:nth-child(5) { width: 20%; }
 
 .quota-cell { display: flex; align-items: center; gap: 8px; }
 .quota-cell input {
@@ -955,6 +956,54 @@ tbody tr:has(input[type="checkbox"]:checked):hover td { background: var(--brass-
 }
 
 #panel-settings .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.settings-limits { margin: 16px 0 8px; }
+.proxy-table { min-width: 480px; }
+.proxy-table th:nth-child(1) { width: 80%; }
+.proxy-table th:nth-child(2) { width: 20%; }
+#proxyModalInput {
+  width: 100%;
+  min-height: 160px;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px/1.5 var(--mono);
+  resize: vertical;
+}
+
+.api-docs { display: grid; gap: 12px; }
+.api-card {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--raised);
+}
+.api-card header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.api-method {
+  display: inline-flex;
+  min-width: 52px;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font: 700 11px/1.4 var(--mono);
+  letter-spacing: .04em;
+}
+.api-method-get { color: #7dcea0; background: rgba(125, 206, 160, .12); }
+.api-method-post { color: #c9a36a; background: rgba(201, 163, 106, .14); }
+.api-path { font: 600 13px/1.4 var(--mono); color: var(--ink); }
+.api-auth { font-size: 12px; color: var(--soft-ink); }
+.api-auth.is-public { color: #7dcea0; }
+.api-sample {
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--bg);
+  font: 12px/1.5 var(--mono);
+  white-space: pre;
+}
 
 .toast {
   position: fixed;

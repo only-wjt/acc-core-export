@@ -22,6 +22,10 @@ services:
       CHROME_PATH: "/usr/bin/google-chrome-stable"
       MAX_CONCURRENCY: "${MAX_CONCURRENCY:-8}"
       PW_CF_MAX: "${PW_CF_MAX:-4}"
+      OPENAPI_KEY: "${OPENAPI_KEY:-}"
+      OPENAPI_CORS: "${OPENAPI_CORS:-*}"
+      OPENAPI_MAX_KEYS: "${OPENAPI_MAX_KEYS:-3}"
+      OPENAPI_RATE_LIMIT: "${OPENAPI_RATE_LIMIT:-60}"
     volumes:
       - acc-data:/data
     shm_size: "2gb"

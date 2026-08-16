@@ -625,7 +625,7 @@ bindFileImport('#importCheck', '#checkFile', '#checkInput', '已导入 Token 文
 
 let currentUser = null;
 
-const USER_PANELS = new Set(['session', 'check', 'password', 'mfa', 'history']);
+const USER_PANELS = new Set(['session', 'check', 'password', 'mfa', 'history', 'openapi']);
 
 function canUsePanel(panel) {
   return currentUser?.role === 'admin' || USER_PANELS.has(panel);
@@ -652,7 +652,10 @@ function applyTabVisibility(user) {
   document.querySelectorAll('.app-panel [data-admin-only]').forEach((node) => {
     node.hidden = !isAdmin;
   });
-  if (!isAdmin) closeUserModal();
+  if (!isAdmin) {
+    closeUserModal();
+    if (typeof closeKeyModal === 'function') closeKeyModal();
+  }
   const active = document.querySelector('.app-tab.is-active');
   if (!user || !active || active.hidden || !canUsePanel(active.dataset.panel)) showPanel('session');
 }
@@ -690,6 +693,8 @@ function applyUser(user) {
   chip.textContent = `${user.username} · ${user.role === 'admin' ? '管理员' : '普通用户'}`;
   applyTabVisibility(user);
   applyConcurrencyQuota(user);
+  void loadKeys();
+  void loadApiDocs();
   const scope = document.querySelector('#historyScope');
   if (scope) {
     scope.textContent = user.role === 'admin'
@@ -887,6 +892,7 @@ async function loadUsers() {
   concurrencyLimit = data.concurrencyLimit || concurrencyLimit;
   const newUserConcurrency = document.querySelector('#newUserConcurrency');
   if (newUserConcurrency) newUserConcurrency.max = String(concurrencyLimit);
+  const rateCeiling = data.rateLimitCeiling || 60;
   body.innerHTML = (data.users || []).map((user) => `
     <tr>
       <td>${escapeHtml(user.username)}</td>
@@ -895,11 +901,88 @@ async function loadUsers() {
         <div class="quota-cell">
           <input type="number" min="1" max="${concurrencyLimit}" step="1" value="${user.concurrency}"
             data-quota-for="${escapeHtml(user.username)}" aria-label="${escapeHtml(user.username)} 的并发数">
+        </div>
+      </td>
+      <td>
+        <div class="quota-cell">
+          <input type="number" min="1" max="${user.role === 'admin' ? 6000 : rateCeiling}" step="1" value="${user.apiRateLimit || rateCeiling}"
+            data-rate-for="${escapeHtml(user.username)}" aria-label="${escapeHtml(user.username)} 的每分钟请求数">
           <button class="retry-button" type="button" data-save-quota="${escapeHtml(user.username)}">保存</button>
         </div>
       </td>
       <td><button class="retry-button" type="button" data-delete-user="${escapeHtml(user.username)}">删除</button></td>
     </tr>`).join('');
+}
+
+async function loadKeys() {
+  if (!currentUser) return;
+  const body = document.querySelector('#keysBody');
+  const head = document.querySelector('#keysHead');
+  if (!body) return;
+  const data = await request('/api/apikeys');
+  const isAdmin = currentUser.role === 'admin';
+  const keyConcurrencyCap = data.concurrencyLimit || currentUser.concurrency || 1;
+  const newKeyConcurrency = document.querySelector('#newKeyConcurrency');
+  if (newKeyConcurrency) {
+    newKeyConcurrency.max = String(keyConcurrencyCap);
+    if (Number(newKeyConcurrency.value) > keyConcurrencyCap) newKeyConcurrency.value = String(keyConcurrencyCap);
+  }
+  const myRate = document.querySelector('#myRateLimit');
+  const myRateHint = document.querySelector('#myRateHint');
+  if (myRate) {
+    const personalCap = isAdmin ? 6000 : data.rateLimitPerMinute;
+    myRate.max = String(personalCap);
+    myRate.value = String(Math.min(data.myRateLimit || data.rateLimitPerMinute, personalCap));
+  }
+  if (myRateHint) {
+    myRateHint.textContent = isAdmin
+      ? '管理员可单独设置，不受每用户上限限制'
+      : `不能超过每用户上限 ${data.rateLimitPerMinute} 次/分钟`;
+  }
+  const note = document.querySelector('#keyQuotaNote');
+  if (note) {
+    note.textContent = `每名用户最多 ${data.maxKeysPerUser} 把密钥。你当前 ${data.myRateLimit} 次/分钟。完整密钥只显示一次，不要共用。`;
+  }
+  if (head) {
+    head.innerHTML = isAdmin
+      ? '<tr><th>归属</th><th>名称</th><th>前缀</th><th>并发数</th><th>操作</th></tr>'
+      : '<tr><th>名称</th><th>前缀</th><th>并发数</th><th>操作</th></tr>';
+  }
+  const rows = data.keys || [];
+  body.innerHTML = rows.map((key) => {
+    const quota = `<div class="quota-cell">
+          <input type="number" min="1" max="${keyConcurrencyCap}" step="1" value="${key.concurrency}"
+            data-key-quota-for="${escapeHtml(key.id)}" aria-label="${escapeHtml(key.name)} 的并发数">
+          <button class="retry-button" type="button" data-save-key-quota="${escapeHtml(key.id)}">保存</button>
+        </div>`;
+    const owner = isAdmin ? `<td>${escapeHtml(key.owner)}</td>` : '';
+    return `<tr>
+      ${owner}
+      <td>${escapeHtml(key.name)}${key.source === 'env' ? ' <small>环境变量</small>' : ''}</td>
+      <td><code>${escapeHtml(key.prefix)}…</code></td>
+      <td>${quota}</td>
+      <td><button class="retry-button" type="button" data-revoke-key="${escapeHtml(key.id)}">撤销</button></td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="${isAdmin ? 5 : 4}">还没有密钥。点右上角创建一把，配给自己的 CDK。</td></tr>`;
+}
+
+async function loadApiDocs() {
+  const root = document.querySelector('#apiDocs');
+  if (!root || !currentUser) return;
+  const spec = await request('/api/openapi/docs');
+  root.innerHTML = (spec.endpoints || []).map((item) => `
+    <article class="api-card">
+      <header>
+        <span class="api-method api-method-${escapeHtml(item.method.toLowerCase())}">${escapeHtml(item.method)}</span>
+        <code class="api-path">${escapeHtml(item.path)}</code>
+        ${item.auth ? '<span class="api-auth">需要密钥</span>' : '<span class="api-auth is-public">无需密钥</span>'}
+      </header>
+      <p>${escapeHtml(item.summary)}</p>
+      ${item.body ? `<pre class="api-sample">${escapeHtml(JSON.stringify(item.body, null, 2))}</pre>` : ''}
+      <button class="icon-text-button" type="button" data-copy-api="${escapeHtml(item.id)}">复制 curl</button>
+    </article>
+  `).join('');
+  root.dataset.spec = JSON.stringify(spec);
 }
 
 const proxies = document.querySelector('#proxies');
@@ -913,6 +996,34 @@ function countProxyLines(text) {
 function updateProxyCount() {
   const total = countProxyLines(proxies?.value || '');
   if (proxyCount) proxyCount.textContent = total ? `${total} 条代理，将随机分配` : '0 条代理，将使用直连';
+}
+
+function maskProxy(line) {
+  try {
+    const parsed = new URL(/:\/\//.test(line) ? line : `socks5://${line}`);
+    if (parsed.password) parsed.password = '***';
+    return parsed.toString();
+  } catch {
+    return line;
+  }
+}
+
+function renderProxyList() {
+  const body = document.querySelector('#proxyList');
+  if (!body) return;
+  const lines = (proxies?.value || '').split(/\r?\n/).filter((line) => line.trim());
+  body.innerHTML = lines.map((line, index) => `
+    <tr>
+      <td><code>${escapeHtml(maskProxy(line))}</code></td>
+      <td><button class="retry-button" type="button" data-remove-proxy="${index}">删除</button></td>
+    </tr>
+  `).join('') || '<tr><td colspan="2">还没有代理。点「添加代理」或导入文件。</td></tr>';
+  updateProxyCount();
+}
+
+function setProxyText(text) {
+  if (proxies) proxies.value = normalizeProxyText(text);
+  renderProxyList();
 }
 
 // 粘贴的代理格式五花八门，统一成每行一条，顺手补协议并去重
@@ -941,6 +1052,22 @@ function applySettings(settings) {
   document.querySelector('#statConcurrencyLimit').textContent = String(concurrencyLimit);
   document.querySelector('#statProxyCount').textContent = String(settings.proxyCount);
   document.querySelector('#statProxyMode').textContent = settings.proxyCount ? '代理池' : '直连';
+  const maxApiKeys = document.querySelector('#maxApiKeys');
+  const apiRateLimit = document.querySelector('#apiRateLimit');
+  if (maxApiKeys && settings.maxApiKeys) maxApiKeys.value = String(settings.maxApiKeys);
+  if (apiRateLimit && settings.apiRateLimit) apiRateLimit.value = String(settings.apiRateLimit);
+  const adminRateLimit = document.querySelector('#adminRateLimit');
+  if (adminRateLimit) adminRateLimit.value = String(currentUser?.apiRateLimit || settings.apiRateLimit || 60);
+  const newUserRate = document.querySelector('#newUserRateLimit');
+  if (newUserRate && settings.apiRateLimit) {
+    newUserRate.max = String(settings.apiRateLimit);
+    newUserRate.value = String(settings.apiRateLimit);
+  }
+  const newUserRateHint = document.querySelector('#newUserRateHint');
+  if (newUserRateHint && settings.apiRateLimit) {
+    newUserRateHint.textContent = `不能超过每用户上限 ${settings.apiRateLimit}`;
+  }
+  renderProxyList();
   const sessionNote = document.querySelector('#sessionRuntimeNote');
   const checkNote = document.querySelector('#checkRuntimeNote');
   const proxyHint = settings.proxyCount ? `代理池 ${settings.proxyCount} 条` : '当前直连';
@@ -966,9 +1093,23 @@ document.querySelector('#saveSettings')?.addEventListener('click', async () => {
   try {
     const result = await request('/api/settings', {
       method: 'PUT',
-      body: JSON.stringify({ proxies: proxies.value }),
+      body: JSON.stringify({
+        proxies: proxies.value,
+        maxApiKeys: Number(document.querySelector('#maxApiKeys')?.value),
+        apiRateLimit: Number(document.querySelector('#apiRateLimit')?.value),
+      }),
     });
     applySettings(result.settings);
+    const adminRate = Number(document.querySelector('#adminRateLimit')?.value);
+    if (Number.isInteger(adminRate) && adminRate > 0) {
+      const me = await request('/api/me', {
+        method: 'PUT',
+        body: JSON.stringify({ apiRateLimit: adminRate }),
+      });
+      currentUser = { ...currentUser, ...me.user };
+      const adminRateLimit = document.querySelector('#adminRateLimit');
+      if (adminRateLimit) adminRateLimit.value = String(me.user.apiRateLimit);
+    }
     showToast(result.notes?.length ? result.notes.join('；') : '配置已保存');
   } catch (error) {
     proxyErrors.textContent = error.message;
@@ -983,21 +1124,57 @@ document.querySelector('#reloadSettings')?.addEventListener('click', () => {
   showToast('已恢复为服务器上的配置');
 });
 
-document.querySelector('#proxyNormalize')?.addEventListener('click', () => {
-  const before = countProxyLines(proxies.value);
-  proxies.value = normalizeProxyText(proxies.value);
-  updateProxyCount();
-  const after = countProxyLines(proxies.value);
-  showToast(before === after ? `已整理 ${after} 条代理` : `已整理并去重，${before} → ${after} 条`);
-});
-
 document.querySelector('#proxyClear')?.addEventListener('click', () => {
-  proxies.value = '';
-  updateProxyCount();
-  showToast('已清空输入，记得保存才会生效');
+  setProxyText('');
+  showToast('已清空列表，记得保存才会生效');
 });
 
-proxies?.addEventListener('input', updateProxyCount);
+proxies?.addEventListener('input', renderProxyList);
+
+const proxyModal = document.querySelector('#proxyModal');
+const proxyModalInput = document.querySelector('#proxyModalInput');
+const proxyModalErrors = document.querySelector('#proxyModalErrors');
+
+function openProxyModal() {
+  if (proxyModalErrors) proxyModalErrors.textContent = '';
+  if (proxyModalInput) proxyModalInput.value = '';
+  if (proxyModal) proxyModal.hidden = false;
+  proxyModalInput?.focus();
+}
+
+function closeProxyModal() {
+  if (proxyModal) proxyModal.hidden = true;
+}
+
+document.querySelector('#openProxyModal')?.addEventListener('click', openProxyModal);
+document.querySelector('#closeProxyModal')?.addEventListener('click', closeProxyModal);
+document.querySelector('#cancelProxyModal')?.addEventListener('click', closeProxyModal);
+proxyModal?.addEventListener('click', (event) => {
+  if (event.target.closest('[data-modal-dismiss]')) closeProxyModal();
+});
+
+document.querySelector('#confirmProxyModal')?.addEventListener('click', () => {
+  const added = normalizeProxyText(proxyModalInput?.value || '');
+  if (!added) {
+    if (proxyModalErrors) proxyModalErrors.textContent = '请先填写或导入至少一条代理';
+    return;
+  }
+  setProxyText(`${proxies.value}\n${added}`);
+  closeProxyModal();
+  showToast(`已加入 ${countProxyLines(added)} 条，记得保存配置`);
+});
+
+bindFileImport('#importProxyModalFile', '#proxyModalFile', '#proxyModalInput', '已导入到弹窗，确认后才会加入列表');
+
+document.querySelector('#proxyList')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-remove-proxy]');
+  if (!button || !proxies) return;
+  const index = Number(button.dataset.removeProxy);
+  const lines = proxies.value.split(/\r?\n/).filter((line) => line.trim());
+  lines.splice(index, 1);
+  setProxyText(lines.join('\n'));
+  showToast('已从列表移除，记得保存配置');
+});
 
 function goToLogin() {
   window.location.replace('/login');
@@ -1066,6 +1243,12 @@ function openUserModal() {
   password.value = '';
   document.querySelector('#newUserRole').value = 'user';
   document.querySelector('#newUserConcurrency').value = '1';
+  const rateField = document.querySelector('#newUserRateLimit');
+  const ceiling = Number(document.querySelector('#apiRateLimit')?.value) || 60;
+  if (rateField) {
+    rateField.max = String(ceiling);
+    rateField.value = String(ceiling);
+  }
   userModal.hidden = false;
   document.querySelector('#newUsername').focus();
 }
@@ -1084,6 +1267,8 @@ userModal?.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && userModal && !userModal.hidden) closeUserModal();
+  if (event.key === 'Escape' && keyModal && !keyModal.hidden) closeKeyModal();
+  if (event.key === 'Escape' && proxyModal && !proxyModal.hidden) closeProxyModal();
 });
 
 function readQuota(input) {
@@ -1111,6 +1296,7 @@ document.querySelector('#createUserButton')?.addEventListener('click', async (ev
         password: document.querySelector('#newUserPassword').value,
         role: document.querySelector('#newUserRole').value,
         concurrency: quota.value,
+        apiRateLimit: Number(document.querySelector('#newUserRateLimit')?.value),
       }),
     });
     closeUserModal();
@@ -1128,19 +1314,25 @@ document.querySelector('#usersBody')?.addEventListener('click', async (event) =>
   if (save) {
     const username = save.dataset.saveQuota;
     const quota = readQuota(document.querySelector(`[data-quota-for="${CSS.escape(username)}"]`));
+    const rateInput = document.querySelector(`[data-rate-for="${CSS.escape(username)}"]`);
+    const rate = Number(rateInput?.value);
     if (quota.error) {
       showToast(quota.error);
+      return;
+    }
+    if (!Number.isInteger(rate) || rate < 1) {
+      showToast('每分钟请求数必须是正整数');
       return;
     }
     save.disabled = true;
     try {
       await request(`/api/users/${encodeURIComponent(username)}`, {
         method: 'PUT',
-        body: JSON.stringify({ concurrency: quota.value }),
+        body: JSON.stringify({ concurrency: quota.value, apiRateLimit: rate }),
       });
-      showToast(`${username} 的并发数已改为 ${quota.value}`);
+      showToast(`${username} 已保存：并发 ${quota.value}，${rate} 次/分钟`);
       if (username === currentUser?.username) {
-        currentUser = { ...currentUser, concurrency: quota.value };
+        currentUser = { ...currentUser, concurrency: quota.value, apiRateLimit: rate };
         applyConcurrencyQuota(currentUser);
       }
       await loadUsers();
@@ -1158,6 +1350,149 @@ document.querySelector('#usersBody')?.addEventListener('click', async (event) =>
     await request(`/api/users/${encodeURIComponent(button.dataset.deleteUser)}`, { method: 'DELETE' });
     showToast('用户已删除');
     await loadUsers();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+const keyModal = document.querySelector('#keyModal');
+const keyFormErrors = document.querySelector('#keyFormErrors');
+const createdKeyBox = document.querySelector('#createdKeyBox');
+const createdKeyValue = document.querySelector('#createdKeyValue');
+const createKeyButton = document.querySelector('#createKeyButton');
+const copyCreatedKey = document.querySelector('#copyCreatedKey');
+
+function resetKeyModal() {
+  if (keyFormErrors) keyFormErrors.textContent = '';
+  if (createdKeyBox) createdKeyBox.hidden = true;
+  if (createdKeyValue) createdKeyValue.value = '';
+  if (createKeyButton) createKeyButton.hidden = false;
+  if (copyCreatedKey) copyCreatedKey.hidden = true;
+  const name = document.querySelector('#newKeyName');
+  if (name) name.value = '';
+  const quota = document.querySelector('#newKeyConcurrency');
+  if (quota) quota.value = String(currentUser?.concurrency || 1);
+}
+
+function openKeyModal() {
+  resetKeyModal();
+  if (keyModal) keyModal.hidden = false;
+  document.querySelector('#newKeyName')?.focus();
+}
+
+function closeKeyModal() {
+  if (keyModal) keyModal.hidden = true;
+  resetKeyModal();
+}
+
+document.querySelector('#openKeyModal')?.addEventListener('click', openKeyModal);
+document.querySelector('#closeKeyModal')?.addEventListener('click', closeKeyModal);
+document.querySelector('#cancelKeyModal')?.addEventListener('click', closeKeyModal);
+keyModal?.addEventListener('click', (event) => {
+  if (event.target.closest('[data-modal-dismiss]')) closeKeyModal();
+});
+
+createKeyButton?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const payload = { name: document.querySelector('#newKeyName').value };
+  const quota = readQuota(document.querySelector('#newKeyConcurrency'));
+  if (quota.error) {
+    keyFormErrors.textContent = quota.error;
+    return;
+  }
+  payload.concurrency = quota.value;
+  keyFormErrors.textContent = '';
+  button.disabled = true;
+  try {
+    const result = await request('/api/apikeys', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (createdKeyBox) createdKeyBox.hidden = false;
+    if (createdKeyValue) createdKeyValue.value = result.key || '';
+    button.hidden = true;
+    if (copyCreatedKey) copyCreatedKey.hidden = false;
+    showToast('密钥已创建，请立即复制');
+    await loadKeys();
+  } catch (error) {
+    keyFormErrors.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector('#saveMyRate')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const value = Number(document.querySelector('#myRateLimit')?.value);
+  if (!Number.isInteger(value) || value < 1) {
+    showToast('每分钟请求数必须是正整数');
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await request('/api/me', {
+      method: 'PUT',
+      body: JSON.stringify({ apiRateLimit: value }),
+    });
+    currentUser = { ...currentUser, ...result.user };
+    showToast(`已设为每分钟 ${result.user.apiRateLimit} 次（上限 ${result.rateLimitCeiling}）`);
+    await loadKeys();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+copyCreatedKey?.addEventListener('click', async () => {
+  if (!createdKeyValue?.value) return;
+  await copyText(createdKeyValue.value, '已复制 API Key');
+});
+
+document.querySelector('#apiDocs')?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-copy-api]');
+  if (!button) return;
+  const spec = JSON.parse(document.querySelector('#apiDocs').dataset.spec || '{}');
+  const item = (spec.endpoints || []).find((entry) => entry.id === button.dataset.copyApi);
+  if (!item) return;
+  const origin = window.location.origin;
+  const curl = item.method === 'GET'
+    ? `curl -sS "${origin}${item.path}" -H "Authorization: Bearer YOUR_API_KEY"`
+    : `curl -sS "${origin}${item.path}" -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json"${item.body ? ` -d '${JSON.stringify(item.body)}'` : ''}`;
+  await copyText(curl, `已复制 ${item.method} ${item.path}`);
+});
+
+document.querySelector('#keysBody')?.addEventListener('click', async (event) => {
+  const save = event.target.closest('[data-save-key-quota]');
+  if (save) {
+    const id = save.dataset.saveKeyQuota;
+    const quota = readQuota(document.querySelector(`[data-key-quota-for="${CSS.escape(id)}"]`));
+    if (quota.error) {
+      showToast(quota.error);
+      return;
+    }
+    save.disabled = true;
+    try {
+      await request(`/api/apikeys/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ concurrency: quota.value }),
+      });
+      showToast(`并发数已改为 ${quota.value}`);
+      await loadKeys();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      save.disabled = false;
+    }
+    return;
+  }
+
+  const revoke = event.target.closest('[data-revoke-key]');
+  if (!revoke) return;
+  try {
+    await request(`/api/apikeys/${encodeURIComponent(revoke.dataset.revokeKey)}`, { method: 'DELETE' });
+    showToast('密钥已撤销');
+    await loadKeys();
   } catch (error) {
     showToast(error.message);
   }

@@ -60,6 +60,7 @@ npm run web
 - Linux / systemd 见 `deploy/linux.md`。
 - 生产 Docker 与热部署见 `deploy/docker.md`。
 - 打包上传：本机执行 `powershell -File deploy/pack.ps1`，把 `dist/acc-core-*.tar.gz` 传到服务器后 `bash deploy/start.sh`。
+- 外部 CDK 对接见 `deploy/openapi.md`（`/openapi/v1`，API Key）。
 
 ## 快速上手
 

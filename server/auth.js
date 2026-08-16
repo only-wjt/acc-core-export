@@ -48,11 +48,21 @@ function userConcurrency(user) {
   return normalizeConcurrency(user.concurrency, defaultConcurrency(user.role)).value;
 }
 
-function publicUser(user) {
+function boundedRate(value, ceiling) {
+  const cap = Math.max(1, Number(ceiling) || 60);
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return { ok: false, value: cap };
+  return { ok: true, value: Math.min(cap, parsed) };
+}
+
+function publicUser(user, ceiling = 60) {
+  const concurrency = userConcurrency(user);
+  const rate = boundedRate(user.apiRateLimit, ceiling);
   return {
     username: user.username,
     role: user.role,
-    concurrency: userConcurrency(user),
+    concurrency,
+    apiRateLimit: rate.value,
     createdAt: user.createdAt || null,
   };
 }
@@ -64,6 +74,7 @@ export function createAuth({
   file = usersPath(),
   ttlMs = DEFAULT_TTL_MS,
   now = () => Date.now(),
+  getRateCeiling = () => Number(process.env.OPENAPI_RATE_LIMIT) || 60,
 } = {}) {
   const adminName = normalizeUsername(adminUsername) || 'admin';
   let users = [];
@@ -105,6 +116,19 @@ export function createAuth({
     throw new Error('绑定非本机地址时必须设置 WORKBENCH_PASSWORD，并创建管理员账号');
   }
 
+  function ceiling() {
+    const raw = Number(getRateCeiling());
+    return Number.isInteger(raw) && raw > 0 ? Math.min(6000, raw) : 60;
+  }
+
+  function rateCapFor(user) {
+    return user?.role === 'admin' ? 6000 : ceiling();
+  }
+
+  function present(user) {
+    return publicUser(user, rateCapFor(user));
+  }
+
   const sessions = new Map();
 
   function persist() {
@@ -125,8 +149,17 @@ export function createAuth({
     return user ? userConcurrency(user) : 1;
   }
 
+  function rateLimitFor(username) {
+    if (!enabled) return ceiling();
+    const user = users.find((entry) => entry.username === normalizeUsername(username));
+    if (!user) return ceiling();
+    return boundedRate(user.apiRateLimit, rateCapFor(user)).value;
+  }
+
   function currentUser(req) {
-    if (!enabled) return { username: 'local', role: 'admin', concurrency: CONCURRENCY_LIMIT };
+    if (!enabled) {
+      return { username: 'local', role: 'admin', concurrency: CONCURRENCY_LIMIT, apiRateLimit: ceiling() };
+    }
     const token = parseCookie(req);
     const session = sessions.get(token);
     if (!session) return null;
@@ -138,6 +171,7 @@ export function createAuth({
       username: session.username,
       role: session.role,
       concurrency: concurrencyFor(session.username),
+      apiRateLimit: rateLimitFor(session.username),
     };
   }
 
@@ -154,7 +188,7 @@ export function createAuth({
     }
     const token = randomBytes(32).toString('hex');
     sessions.set(token, { username: user.username, role: user.role, expiresAt: now() + ttlMs });
-    return { ok: true, token, maxAge: Math.floor(ttlMs / 1000), user: publicUser(user) };
+    return { ok: true, token, maxAge: Math.floor(ttlMs / 1000), user: present(user) };
   }
 
   function logout(req) {
@@ -163,10 +197,10 @@ export function createAuth({
   }
 
   function listUsers() {
-    return users.map(publicUser);
+    return users.map(present);
   }
 
-  function createUser({ username, password: candidate, role = 'user', concurrency } = {}) {
+  function createUser({ username, password: candidate, role = 'user', concurrency, apiRateLimit } = {}) {
     const name = normalizeUsername(username);
     if (!name || name.length < 2) return { ok: false, error: '用户名至少 2 个字符' };
     if (!candidate || String(candidate).length < 4) return { ok: false, error: '口令至少 4 位' };
@@ -174,22 +208,57 @@ export function createAuth({
     if (users.some((user) => user.username === name)) return { ok: false, error: '用户名已存在' };
     const quota = normalizeConcurrency(concurrency === undefined ? 1 : concurrency, null);
     if (!quota.ok) return { ok: false, error: `并发数必须是 1 到 ${CONCURRENCY_LIMIT} 之间的整数` };
-    const user = { username: name, role, createdAt: now(), concurrency: quota.value, ...hashPassword(candidate) };
+    const cap = role === 'admin' ? 6000 : ceiling();
+    const rate = apiRateLimit === undefined ? { ok: true, value: Math.min(ceiling(), cap) } : boundedRate(apiRateLimit, cap);
+    if (apiRateLimit !== undefined && (!Number.isInteger(Number(apiRateLimit)) || Number(apiRateLimit) < 1 || Number(apiRateLimit) > cap)) {
+      return { ok: false, error: role === 'admin'
+        ? '管理员每分钟请求数必须是 1 到 6000 的整数'
+        : `每分钟请求数必须是 1 到 ${cap} 的整数` };
+    }
+    const user = {
+      username: name,
+      role,
+      createdAt: now(),
+      concurrency: quota.value,
+      apiRateLimit: rate.value,
+      ...hashPassword(candidate),
+    };
     users.push(user);
     persist();
-    return { ok: true, user: publicUser(user) };
+    return { ok: true, user: present(user) };
   }
 
-  function updateUser(username, { concurrency } = {}) {
+  function applyRateLimit(user, apiRateLimit) {
+    const cap = rateCapFor(user);
+    const parsed = Number(apiRateLimit);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      return { ok: false, error: `每分钟请求数必须是 1 到 ${cap} 的整数` };
+    }
+    if (parsed > cap) {
+      return { ok: false, error: user.role === 'admin'
+        ? '管理员自己的请求数上限是 6000 次/分钟'
+        : `不能超过通用设置的每用户上限 ${cap} 次/分钟` };
+    }
+    user.apiRateLimit = parsed;
+    return { ok: true };
+  }
+
+  function updateUser(username, { concurrency, apiRateLimit } = {}) {
     const name = normalizeUsername(username);
     const user = users.find((entry) => entry.username === name);
     if (!user) return { ok: false, error: '用户不存在' };
-    if (concurrency === undefined) return { ok: false, error: '没有需要修改的内容' };
-    const quota = normalizeConcurrency(concurrency, null);
-    if (!quota.ok) return { ok: false, error: `并发数必须是 1 到 ${CONCURRENCY_LIMIT} 之间的整数` };
-    user.concurrency = quota.value;
+    if (concurrency === undefined && apiRateLimit === undefined) return { ok: false, error: '没有需要修改的内容' };
+    if (concurrency !== undefined) {
+      const quota = normalizeConcurrency(concurrency, null);
+      if (!quota.ok) return { ok: false, error: `并发数必须是 1 到 ${CONCURRENCY_LIMIT} 之间的整数` };
+      user.concurrency = quota.value;
+    }
+    if (apiRateLimit !== undefined) {
+      const rate = applyRateLimit(user, apiRateLimit);
+      if (!rate.ok) return rate;
+    }
     persist();
-    return { ok: true, user: publicUser(user) };
+    return { ok: true, user: present(user) };
   }
 
   function deleteUser(username, actor) {
@@ -237,6 +306,7 @@ export function createAuth({
     authorized,
     currentUser,
     concurrencyFor,
+    rateLimitFor,
     login,
     logout,
     listUsers,

@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>ACC 工作台</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 42 42'><rect width='42' height='42' rx='12' fill='%23c9a36a' fill-opacity='0.12'/><rect width='42' height='42' rx='12' fill='none' stroke='%23c9a36a' stroke-width='1'/><circle cx='21' cy='15' r='5' fill='none' stroke='%23c9a36a' stroke-width='1.6'/><rect x='19.5' y='21' width='3' height='10' rx='1' fill='%23c9a36a'/></svg>">
-  <link rel="stylesheet" href="/styles.css?v=4">
+  <link rel="stylesheet" href="/styles.css?v=7">
   <script src="/theme.js?v=2"></script>
 </head>
 <body>
@@ -40,6 +40,7 @@
       <button class="app-tab" type="button" data-panel="password">改密</button>
       <button class="app-tab" type="button" data-panel="mfa">2FA</button>
       <button class="app-tab" type="button" data-panel="history">历史</button>
+      <button class="app-tab" type="button" data-panel="openapi">开放 API</button>
       <button class="app-tab" type="button" data-panel="totp" data-admin-only="true" hidden>TOTP</button>
       <button class="app-tab" type="button" data-panel="mail" data-admin-only="true" hidden>收信</button>
       <button class="app-tab" type="button" data-panel="settings" data-admin-only="true" hidden>设置</button>
@@ -380,27 +381,54 @@
       <section class="control-band">
         <div class="section-heading">
           <div>
+            <p class="section-kicker">通用设置</p>
+            <h2>每名用户的默认上限</h2>
+          </div>
+        </div>
+        <p class="action-note block-note">这里限制的是<strong>每个用户</strong>最多能到多少，不是全站合计。普通用户不能超过这个数；管理员自己的次数在下面单独设。</p>
+        <div class="form-grid settings-limits">
+          <label class="compact-field">
+            <span>每名用户最多密钥数</span>
+            <input id="maxApiKeys" type="number" min="1" max="20" step="1" value="3">
+          </label>
+          <label class="compact-field">
+            <span>每名用户最大请求次数 <small>次/分钟</small></span>
+            <input id="apiRateLimit" type="number" min="1" max="6000" step="1" value="60">
+          </label>
+          <label class="compact-field">
+            <span>管理员自己的请求次数 <small>次/分钟，可高于上面</small></span>
+            <input id="adminRateLimit" type="number" min="1" max="6000" step="1" value="60">
+          </label>
+        </div>
+      </section>
+
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
             <p class="section-kicker">运行配置</p>
             <h2>代理池</h2>
           </div>
           <div class="parse-count" id="proxyCount">0 条代理，将使用直连</div>
         </div>
-
-        <label class="field-label" for="proxies">代理池</label>
-        <p class="field-hint">每行一条，支持 <code>socks5://user:pass@host:port</code>、<code>http://host:port</code>，也认 <code>host:port:user:pass</code> 和空格/逗号分隔的粘贴内容。保存时会自动补协议、去重、忽略 <code>#</code> 注释。</p>
+        <p class="field-hint">点「添加代理」用弹窗写入，或直接导入文件。支持 <code>socks5://user:pass@host:port</code>、<code>http://host:port</code>、<code>host:port:user:pass</code>。</p>
         <div class="import-row">
+          <button class="primary-button" id="openProxyModal" type="button">添加代理</button>
           <button class="icon-text-button" id="importProxies" type="button">导入文件</button>
-          <button class="icon-text-button" id="proxyNormalize" type="button">整理去重</button>
           <button class="icon-text-button" id="proxyClear" type="button">清空</button>
           <input id="proxiesFile" type="file" accept=".txt,.csv,.log" hidden>
         </div>
-        <textarea id="proxies" rows="9" spellcheck="false" autocomplete="off" placeholder="socks5://user:pass@host:port&#10;http://user:pass@host:port&#10;host:port:user:pass"></textarea>
+        <textarea id="proxies" hidden></textarea>
+        <div class="table-wrap spaced">
+          <table class="users-table proxy-table">
+            <thead><tr><th>代理</th><th>操作</th></tr></thead>
+            <tbody id="proxyList"></tbody>
+          </table>
+        </div>
         <div class="input-errors" id="proxyErrors" role="alert"></div>
-
         <div class="action-row">
           <button class="primary-button" id="saveSettings" type="button">保存配置</button>
           <button class="secondary-button" id="reloadSettings" type="button">放弃修改</button>
-          <p class="action-note">普通用户看不到也改不了这里；所有任务都用这份代理池。并发数按账号分配，在「用户」页设置，上限 <strong id="concurrencyLimit">20</strong>。</p>
+          <p class="action-note">普通用户看不到也改不了这里。任务并发上限 <strong id="concurrencyLimit">20</strong>。</p>
         </div>
       </section>
 
@@ -431,10 +459,49 @@
         <p class="action-note block-note">普通用户不能自己注册。在这里开好账号后，把用户名和口令发给对方。每个账号的并发数单独分配，普通用户默认 1。</p>
         <div class="table-wrap spaced">
           <table class="users-table">
-            <thead><tr><th>用户名</th><th>角色</th><th>并发数</th><th>操作</th></tr></thead>
+            <thead><tr><th>用户名</th><th>角色</th><th>并发数</th><th>每分钟请求</th><th>操作</th></tr></thead>
             <tbody id="usersBody"></tbody>
           </table>
         </div>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-openapi" data-panel="openapi" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">对接</p>
+            <h2>我的 API 密钥</h2>
+          </div>
+          <button class="primary-button" id="openKeyModal" type="button">创建密钥</button>
+        </div>
+        <p class="action-note block-note" id="keyQuotaNote">每名用户自己创建密钥，不要共用。完整密钥只在创建时显示一次。</p>
+        <div class="form-grid settings-limits">
+          <label class="compact-field">
+            <span>我的每分钟请求上限 <small id="myRateHint">不能超过每用户上限</small></span>
+            <input id="myRateLimit" type="number" min="1" max="60" step="1" value="60">
+          </label>
+          <div class="compact-field">
+            <span>&nbsp;</span>
+            <button class="primary-button" id="saveMyRate" type="button">保存频率</button>
+          </div>
+        </div>
+        <div class="table-wrap spaced">
+          <table class="users-table keys-table">
+            <thead id="keysHead"></thead>
+            <tbody id="keysBody"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">文档</p>
+            <h2>开放接口</h2>
+          </div>
+        </div>
+        <p class="action-note block-note">CDK 用下面这些接口。鉴权头：<code>Authorization: Bearer &lt;你的密钥&gt;</code>。</p>
+        <div id="apiDocs" class="api-docs"></div>
       </section>
     </div>
   </main>
@@ -465,6 +532,10 @@
           <span>并发数 <small>默认 1</small></span>
           <input id="newUserConcurrency" type="number" min="1" max="20" step="1" value="1">
         </label>
+        <label class="compact-field">
+          <span>每分钟请求 <small id="newUserRateHint">不能超过通用上限</small></span>
+          <input id="newUserRateLimit" type="number" min="1" max="60" step="1" value="60">
+        </label>
       </div>
       <div class="input-errors" id="userFormErrors" role="alert"></div>
       <div class="modal-actions">
@@ -475,7 +546,65 @@
     </section>
   </div>
 
+  <div class="modal" id="proxyModal" hidden>
+    <div class="modal-scrim" data-modal-dismiss="true"></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="proxyModalTitle">
+      <div class="modal-head">
+        <div>
+          <p class="section-kicker">代理池</p>
+          <h2 id="proxyModalTitle">添加代理</h2>
+        </div>
+        <button class="modal-close" id="closeProxyModal" type="button" aria-label="关闭">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <p class="field-hint">每行一条，也可从文件导入后再确认添加。</p>
+      <div class="import-row">
+        <button class="icon-text-button" id="importProxyModalFile" type="button">导入文件</button>
+        <input id="proxyModalFile" type="file" accept=".txt,.csv,.log" hidden>
+      </div>
+      <textarea id="proxyModalInput" rows="8" spellcheck="false" autocomplete="off" placeholder="socks5://user:pass@host:port&#10;http://host:port&#10;host:port:user:pass"></textarea>
+      <div class="input-errors" id="proxyModalErrors" role="alert"></div>
+      <div class="modal-actions">
+        <button class="secondary-button" id="cancelProxyModal" type="button">取消</button>
+        <button class="primary-button" id="confirmProxyModal" type="button">添加到列表</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="modal" id="keyModal" hidden>
+    <div class="modal-scrim" data-modal-dismiss="true"></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="keyModalTitle">
+      <div class="modal-head">
+        <div>
+          <p class="section-kicker">对接</p>
+          <h2 id="keyModalTitle">创建 API 密钥</h2>
+        </div>
+        <button class="modal-close" id="closeKeyModal" type="button" aria-label="关闭">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <div class="form-grid">
+        <label class="compact-field"><span>名称</span><input id="newKeyName" type="text" placeholder="例如 cdk-prod" autocomplete="off"></label>
+        <label class="compact-field" id="newKeyConcurrencyField">
+          <span>并发数 <small>不能超过账号配额</small></span>
+          <input id="newKeyConcurrency" type="number" min="1" max="20" step="1" value="1">
+        </label>
+      </div>
+      <div class="input-errors" id="keyFormErrors" role="alert"></div>
+      <div id="createdKeyBox" hidden>
+        <p class="action-note block-note">请立即复制，关闭后无法再看完整密钥。</p>
+        <label class="compact-field"><span>API Key</span><input id="createdKeyValue" type="text" readonly></label>
+      </div>
+      <div class="modal-actions">
+        <button class="secondary-button" id="cancelKeyModal" type="button">关闭</button>
+        <button class="primary-button" id="createKeyButton" type="button">创建</button>
+        <button class="primary-button" id="copyCreatedKey" type="button" hidden>复制密钥</button>
+      </div>
+    </section>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js?v=3"></script>
+  <script type="module" src="/app.js?v=7"></script>
 </body>
 </html>
