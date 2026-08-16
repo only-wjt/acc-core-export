@@ -1,0 +1,12 @@
+.git
+.claude
+.cursor
+node_modules
+data
+captures
+myagents_files
+deploy/.env
+deploy/*.md
+test
+*.md
+.gitignore

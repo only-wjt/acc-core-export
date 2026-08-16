@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ACC 工作台</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 42 42'><rect width='42' height='42' rx='12' fill='%23c9a36a' fill-opacity='0.12'/><rect width='42' height='42' rx='12' fill='none' stroke='%23c9a36a' stroke-width='1'/><circle cx='21' cy='15' r='5' fill='none' stroke='%23c9a36a' stroke-width='1.6'/><rect x='19.5' y='21' width='3' height='10' rx='1' fill='%23c9a36a'/></svg>">
+  <link rel="stylesheet" href="/styles.css?v=4">
+  <script src="/theme.js?v=2"></script>
+</head>
+<body>
+  <main class="workspace">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">Account Control</p>
+          <h1>ACC 工作台</h1>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="user-chip" id="userChip" hidden></span>
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换白天/夜间外观">
+          <svg class="icon-sun" aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.4M12 19v2.4M4.2 12H1.8M22.2 12h-2.4M6.3 6.3 4.6 4.6M19.4 19.4l-1.7-1.7M17.7 6.3l1.7-1.7M4.6 19.4l1.7-1.7"/></svg>
+          <svg class="icon-moon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4a8.4 8.4 0 1 0 10.2 10.2Z"/></svg>
+          <span id="themeLabel">夜间</span>
+        </button>
+        <button class="icon-text-button" id="logoutButton" type="button" hidden>退出登录</button>
+        <div class="privacy-mark" id="privacyMark" title="输入和结果仅保留在当前进程内存中">
+          <span class="privacy-dot" aria-hidden="true"></span>
+          <span id="privacyText">不保存数据</span>
+        </div>
+      </div>
+    </header>
+
+    <nav class="app-tabs" role="tablist" aria-label="功能">
+      <button class="app-tab is-active" type="button" data-panel="session">取 Session</button>
+      <button class="app-tab" type="button" data-panel="check">验活</button>
+      <button class="app-tab" type="button" data-panel="password">改密</button>
+      <button class="app-tab" type="button" data-panel="mfa">2FA</button>
+      <button class="app-tab" type="button" data-panel="history">历史</button>
+      <button class="app-tab" type="button" data-panel="totp" data-admin-only="true" hidden>TOTP</button>
+      <button class="app-tab" type="button" data-panel="mail" data-admin-only="true" hidden>收信</button>
+      <button class="app-tab" type="button" data-panel="settings" data-admin-only="true" hidden>设置</button>
+      <button class="app-tab" type="button" data-panel="users" id="usersTab" data-admin-only="true" hidden>用户</button>
+    </nav>
+
+    <div class="app-panel" id="panel-session" data-panel="session">
+    <section class="control-band" aria-labelledby="input-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">账号队列</p>
+          <h2 id="input-title">批量获取 GPT Session</h2>
+        </div>
+        <div class="parse-count" id="parseCount">0 条有效输入</div>
+      </div>
+
+      <label class="field-label" for="accounts">账号数据</label>
+      <div class="import-row">
+        <button class="icon-text-button" id="importAccounts" type="button">导入账号文件</button>
+        <input id="accountsFile" type="file" accept=".txt,.csv,.log" hidden>
+      </div>
+      <div class="secret-editor">
+        <textarea id="accounts" rows="9" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="支持两种格式：&#10;邮箱----GPT密码----邮箱密码&#10;或&#10;邮箱:邮箱密码"></textarea>
+        <button class="icon-button" id="toggleSecrets" type="button" title="显示输入内容" aria-label="显示输入内容">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+        </button>
+      </div>
+      <div class="input-errors" id="inputErrors" role="alert"></div>
+
+      <div class="runtime-row" data-admin-only="true" hidden>
+        <label class="compact-field concurrency-field">
+          <span>并发数 <small>管理员可临时调整</small></span>
+          <input id="concurrency" type="number" min="1" max="20" step="1" value="2">
+        </label>
+        <p class="runtime-note" id="sessionRuntimeNote">代理池在「设置」页配置，并发数按账号分配。</p>
+      </div>
+
+      <div class="action-row">
+        <button class="primary-button" id="startButton" type="button">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>
+          开始获取
+        </button>
+        <button class="secondary-button" id="cancelButton" type="button" disabled>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11"/></svg>
+          取消任务
+        </button>
+        <p class="action-note">每个账号随机固定使用一条代理，并通过邮箱验证码登录 GPT。代理由管理员统一配置。</p>
+      </div>
+    </section>
+
+    <section class="run-band" aria-labelledby="progress-title">
+      <div class="section-heading status-heading">
+        <div>
+          <p class="section-kicker">运行状态</p>
+          <h2 id="progress-title">处理进度</h2>
+        </div>
+        <div class="status-summary" id="statusSummary">等待开始</div>
+      </div>
+
+      <div class="progress-track" aria-hidden="true"><span id="progressBar"></span></div>
+      <div class="metrics" aria-label="任务统计">
+        <div><strong id="metricTotal">0</strong><span>总数</span></div>
+        <div><strong id="metricRunning">0</strong><span>处理中</span></div>
+        <div><strong id="metricSuccess">0</strong><span>成功</span></div>
+        <div><strong id="metricFailed">0</strong><span>失败</span></div>
+      </div>
+
+      <p class="rate-hint" id="rateHint" role="status" hidden></p>
+
+      <div class="table-toolbar">
+        <div class="filter-tabs" role="tablist" aria-label="账号筛选">
+          <button class="filter-tab is-active" id="filterAll" type="button" data-filter="all">全部</button>
+          <button class="filter-tab" id="filterFailed" type="button" data-filter="failed">仅失败</button>
+        </div>
+        <div class="table-actions">
+          <button class="icon-text-button" id="copyFailedButton" type="button" disabled>复制失败邮箱</button>
+          <button class="icon-text-button" id="retrySelectedButton" type="button" disabled>重试所选</button>
+          <button class="icon-text-button" id="retryFailedButton" type="button" disabled>重试全部失败</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="job-table">
+          <thead><tr>
+            <th class="select-col"><input type="checkbox" id="selectAllAccounts" aria-label="全选可重试账号"></th>
+            <th>账号</th><th>当前步骤</th><th>状态</th><th>耗时</th><th>说明</th><th>操作</th>
+          </tr></thead>
+          <tbody id="statusBody">
+            <tr class="empty-row"><td colspan="7">开始任务后，这里会逐项显示进度。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="result-band" aria-labelledby="result-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">成功结果</p>
+          <h2 id="result-title">Session 输出</h2>
+        </div>
+        <div class="result-actions">
+          <button class="icon-text-button copy-all-button" id="copyButton" type="button" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="1"/><path d="M16 8V5H5v11h3"/></svg>
+            一键复制全部
+          </button>
+          <button class="icon-text-button" id="downloadButton" type="button" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>
+            下载
+          </button>
+          <button class="icon-text-button" id="exportExcelButton" type="button" disabled title="导出为 CSV，可直接用 Excel 打开：邮箱 / GPT密码 / 邮箱密码 / session">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h6"/></svg>
+            导出 Excel
+          </button>
+        </div>
+      </div>
+      <div class="session-list" id="sessionList">
+        <p class="session-empty">成功获取的 Session 将在这里逐条显示。</p>
+      </div>
+    </section>
+    </div>
+
+    <div class="app-panel" id="panel-check" data-panel="check" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">账号盘点</p>
+            <h2>批量验活</h2>
+          </div>
+          <div class="parse-count" id="checkParseCount">0 条有效输入</div>
+        </div>
+        <label class="field-label" for="checkInput">Session 列表</label>
+        <div class="import-row">
+          <button class="icon-text-button" id="importCheck" type="button">导入 Token 文件</button>
+          <input id="checkFile" type="file" accept=".txt,.csv,.log" hidden>
+        </div>
+        <textarea id="checkInput" rows="8" spellcheck="false" autocomplete="off" placeholder="每行一条：&#10;邮箱----sessionToken&#10;或直接粘贴 sessionToken"></textarea>
+        <div class="runtime-row" data-admin-only="true" hidden>
+          <label class="compact-field concurrency-field">
+            <span>并发数 <small>管理员可临时调整</small></span>
+            <input id="checkConcurrency" type="number" min="1" max="20" step="1" value="5">
+          </label>
+          <p class="runtime-note" id="checkRuntimeNote">代理池在「设置」页配置，并发数按账号分配。</p>
+        </div>
+        <div class="action-row">
+          <button class="primary-button" id="checkStart" type="button">开始验活</button>
+          <button class="secondary-button" id="checkCancel" type="button" disabled>取消</button>
+          <button class="icon-text-button" id="checkRetrySelected" type="button" disabled>重试所选</button>
+          <button class="icon-text-button" id="checkRetryFailed" type="button" disabled>重试失败</button>
+          <p class="action-note">用已有 Session 检查是否有效、过期、被封或被代理拦截，不重新登录。</p>
+        </div>
+      </section>
+      <section class="run-band">
+        <div class="metrics" aria-label="验活统计">
+          <div><strong id="checkTotal">0</strong><span>总数</span></div>
+          <div><strong id="checkRunning">0</strong><span>处理中</span></div>
+          <div><strong id="checkAlive">0</strong><span>有效</span></div>
+          <div><strong id="checkDead">0</strong><span>失效</span></div>
+        </div>
+        <div class="table-wrap spaced">
+          <table class="job-table">
+            <thead><tr>
+              <th class="select-col"><input type="checkbox" id="selectAllChecks" aria-label="全选失效账号"></th>
+              <th>账号</th><th>结果</th><th>套餐</th><th>原因</th><th>操作</th>
+            </tr></thead>
+            <tbody id="checkBody"><tr class="empty-row"><td colspan="6">开始验活后，这里会显示每条结果。</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-totp" data-panel="totp" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">本地计算</p>
+            <h2>TOTP 计算器</h2>
+          </div>
+        </div>
+        <label class="field-label" for="totpSecret">Authenticator Secret（Base32）</label>
+        <input id="totpSecret" type="text" spellcheck="false" autocomplete="off" placeholder="JBSWY3DPEHPK3PXP">
+        <div class="totp-card">
+          <div class="totp-code" id="totpCode">------</div>
+          <div class="totp-meta">剩余 <strong id="totpRemain">30</strong> 秒</div>
+          <div class="progress-track totp-bar"><span id="totpBar"></span></div>
+          <button class="icon-text-button" id="totpCopy" type="button">复制验证码</button>
+        </div>
+        <p class="action-note block-note">验证码在浏览器本地按 RFC 6238 计算，Secret 不会发到服务器。</p>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-mail" data-panel="mail" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">mail.com</p>
+            <h2>邮箱工具</h2>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="compact-field"><span>邮箱</span><input id="mailEmail" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>邮箱密码</span><input id="mailPassword" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>代理（可选）</span><input id="mailProxy" type="text" placeholder="socks5://..."></label>
+        </div>
+        <div class="action-row">
+          <button class="primary-button" id="mailList" type="button">拉取收件箱</button>
+          <button class="secondary-button" id="mailOtp" type="button">取最新 OTP</button>
+          <button class="secondary-button" id="mailWaitOtp" type="button">等待 OTP（60s）</button>
+        </div>
+        <label class="field-label spaced" for="mailPattern">链接匹配（正则）</label>
+        <div class="action-row">
+          <input id="mailPattern" class="grow" type="text" placeholder="https://chatgpt.com/\\S+">
+          <button class="icon-text-button" id="mailLink" type="button">提取链接</button>
+        </div>
+        <pre class="tool-output" id="mailOutput">结果会显示在这里。</pre>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-mfa" data-panel="mfa" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">ChatGPT</p>
+            <h2>2FA 开关</h2>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="compact-field"><span>邮箱</span><input id="mfaEmail" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>GPT 密码</span><input id="mfaGptPassword" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>邮箱密码（开 2FA 取码）</span><input id="mfaMailPassword" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>现有 TOTP Secret（关 2FA 必填）</span><input id="mfaSecret" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>Session Token（可选）</span><input id="mfaSession" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>代理（可选）</span><input id="mfaProxy" type="text" placeholder="socks5://..."></label>
+        </div>
+        <div class="action-row">
+          <button class="primary-button" id="mfaEnable" type="button">开启 2FA</button>
+          <button class="secondary-button" id="mfaDisable" type="button">关闭 2FA</button>
+        </div>
+        <pre class="tool-output" id="mfaOutput">开启成功后会返回新的 totpSecret，请立刻保存。</pre>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-password" data-panel="password" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">账号维护</p>
+            <h2>修改密码</h2>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="compact-field"><span>邮箱</span><input id="pwEmail" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>当前 GPT 密码</span><input id="pwGpt" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>当前邮箱密码</span><input id="pwMail" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>TOTP Secret（GPT 改密如需）</span><input id="pwSecret" type="text" autocomplete="off"></label>
+          <label class="compact-field"><span>新密码</span><input id="pwNew" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>代理（可选）</span><input id="pwProxy" type="text" placeholder="socks5://..."></label>
+        </div>
+        <div class="action-row">
+          <button class="primary-button" id="pwGptBtn" type="button">改 GPT 密码</button>
+          <button class="secondary-button" id="pwMailBtn" type="button">改邮箱密码</button>
+        </div>
+        <pre class="tool-output" id="pwOutput">改密成功后请立刻更新本地记录。</pre>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-history" data-panel="history" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">本地归档</p>
+            <h2>任务历史</h2>
+          </div>
+          <button class="icon-text-button" id="historyRefresh" type="button">刷新</button>
+        </div>
+        <p class="action-note block-note" id="historyScope">任务结束后自动归档，只存结果不存密码。</p>
+
+        <div class="search-row">
+          <label class="search-field">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.6-3.6"/></svg>
+            <input id="historySearch" type="search" placeholder="搜邮箱、操作者或任务 ID" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="filter-tabs" role="tablist" aria-label="任务类型">
+            <button class="filter-tab is-active" type="button" data-history-kind="">全部</button>
+            <button class="filter-tab" type="button" data-history-kind="session">取 Session</button>
+            <button class="filter-tab" type="button" data-history-kind="check">验活</button>
+          </div>
+        </div>
+
+        <div class="table-wrap spaced">
+          <table class="history-table">
+            <thead><tr><th>类型</th><th>操作者</th><th>时间</th><th>结果</th><th>账号</th><th>操作</th></tr></thead>
+            <tbody id="historyBody">
+              <tr class="empty-row"><td colspan="6">正在读取归档…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pager">
+          <span class="pager-info" id="historyCount">—</span>
+          <div class="pager-controls">
+            <button class="icon-text-button" id="historyPrev" type="button" disabled>上一页</button>
+            <span class="pager-page" id="historyPage">1 / 1</span>
+            <button class="icon-text-button" id="historyNext" type="button" disabled>下一页</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="result-band" id="historyDetailBand" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">明细</p>
+            <h2 id="historyDetailTitle">任务明细</h2>
+          </div>
+          <div class="result-actions">
+            <button class="icon-text-button" id="historyCopySessions" type="button" disabled>复制 Session</button>
+            <button class="icon-text-button" id="historyCloseDetail" type="button">收起</button>
+          </div>
+        </div>
+        <div class="search-row">
+          <label class="search-field">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.6-3.6"/></svg>
+            <input id="historyDetailSearch" type="search" placeholder="在这次任务里搜邮箱" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="filter-tabs" role="tablist" aria-label="明细筛选">
+            <button class="filter-tab is-active" type="button" data-detail-filter="all">全部</button>
+            <button class="filter-tab" type="button" data-detail-filter="bad">仅失败/失效</button>
+          </div>
+        </div>
+        <div class="table-wrap spaced">
+          <table>
+            <thead><tr><th>账号</th><th>状态</th><th>套餐</th><th>说明</th></tr></thead>
+            <tbody id="historyDetailBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-settings" data-panel="settings" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">运行配置</p>
+            <h2>代理池</h2>
+          </div>
+          <div class="parse-count" id="proxyCount">0 条代理，将使用直连</div>
+        </div>
+
+        <label class="field-label" for="proxies">代理池</label>
+        <p class="field-hint">每行一条，支持 <code>socks5://user:pass@host:port</code>、<code>http://host:port</code>，也认 <code>host:port:user:pass</code> 和空格/逗号分隔的粘贴内容。保存时会自动补协议、去重、忽略 <code>#</code> 注释。</p>
+        <div class="import-row">
+          <button class="icon-text-button" id="importProxies" type="button">导入文件</button>
+          <button class="icon-text-button" id="proxyNormalize" type="button">整理去重</button>
+          <button class="icon-text-button" id="proxyClear" type="button">清空</button>
+          <input id="proxiesFile" type="file" accept=".txt,.csv,.log" hidden>
+        </div>
+        <textarea id="proxies" rows="9" spellcheck="false" autocomplete="off" placeholder="socks5://user:pass@host:port&#10;http://user:pass@host:port&#10;host:port:user:pass"></textarea>
+        <div class="input-errors" id="proxyErrors" role="alert"></div>
+
+        <div class="action-row">
+          <button class="primary-button" id="saveSettings" type="button">保存配置</button>
+          <button class="secondary-button" id="reloadSettings" type="button">放弃修改</button>
+          <p class="action-note">普通用户看不到也改不了这里；所有任务都用这份代理池。并发数按账号分配，在「用户」页设置，上限 <strong id="concurrencyLimit">20</strong>。</p>
+        </div>
+      </section>
+
+      <section class="result-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">当前生效</p>
+            <h2>配置概览</h2>
+          </div>
+        </div>
+        <div class="metrics">
+          <div><strong id="statProxyCount">0</strong><span>代理条数</span></div>
+          <div><strong id="statProxyMode">直连</strong><span>出口方式</span></div>
+          <div><strong id="statConcurrencyLimit">20</strong><span>并发上限</span></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="app-panel" id="panel-users" data-panel="users" hidden>
+      <section class="control-band">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">权限</p>
+            <h2>用户管理</h2>
+          </div>
+          <button class="primary-button" id="openUserModal" type="button">添加用户</button>
+        </div>
+        <p class="action-note block-note">普通用户不能自己注册。在这里开好账号后，把用户名和口令发给对方。每个账号的并发数单独分配，普通用户默认 1。</p>
+        <div class="table-wrap spaced">
+          <table class="users-table">
+            <thead><tr><th>用户名</th><th>角色</th><th>并发数</th><th>操作</th></tr></thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div class="modal" id="userModal" hidden>
+    <div class="modal-scrim" data-modal-dismiss="true"></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+      <div class="modal-head">
+        <div>
+          <p class="section-kicker">权限</p>
+          <h2 id="userModalTitle">添加用户</h2>
+        </div>
+        <button class="modal-close" id="closeUserModal" type="button" aria-label="关闭">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <div class="form-grid">
+        <label class="compact-field"><span>用户名</span><input id="newUsername" type="text" autocomplete="off"></label>
+        <label class="compact-field"><span>口令</span><input id="newUserPassword" type="password" autocomplete="off"></label>
+        <label class="compact-field">
+          <span>角色</span>
+          <select id="newUserRole">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+        </label>
+        <label class="compact-field">
+          <span>并发数 <small>默认 1</small></span>
+          <input id="newUserConcurrency" type="number" min="1" max="20" step="1" value="1">
+        </label>
+      </div>
+      <div class="input-errors" id="userFormErrors" role="alert"></div>
+      <div class="modal-actions">
+        <button class="icon-text-button" id="generateUserPassword" type="button">生成口令</button>
+        <button class="secondary-button" id="cancelUserModal" type="button">取消</button>
+        <button class="primary-button" id="createUserButton" type="button">创建</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js?v=3"></script>
+</body>
+</html>

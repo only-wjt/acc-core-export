@@ -1,0 +1,18 @@
+{
+  "name": "acc-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ACC 核心协议层：邮箱登录收信 + GPT 登录/session/AT/2FA 增删改，脱离存储层独立运行",
+  "scripts": {
+    "demo": "node examples/demo.mjs",
+    "web": "node server/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cycletls": "^2.0.5",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "playwright": "^1.61.1"
+  }
+}

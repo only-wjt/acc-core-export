@@ -1,0 +1,11 @@
+.claude/
+.cursor/
+.playwright-mcp/
+audit-screenshots/
+myagents_files/
+node_modules/
+data/
+captures/
+deploy/.env
+.env
+dist/
