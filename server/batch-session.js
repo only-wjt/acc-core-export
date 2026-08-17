@@ -20,6 +20,7 @@ function classifyError(error) {
   if (/(验证码|OTP|未取到.*码|邮件验证)/i.test(text)) return 'otp';
   if (/(429|rate[\s_-]*limit|too many|风控|频率|blocked|封禁|challenge|cloudflare|人机验证|访问被拒)/i.test(text)) return 'risk';
   if (/(代理|proxy|socks|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|tunnel|socket hang up|network|fetch failed|getaddrinfo|连接超时|无法连接)/i.test(text)) return 'proxy';
+  if (/取消续费|will_renew/i.test(text)) return 'billing';
   if (/session/i.test(text)) return 'session';
   return 'unknown';
 }
@@ -151,6 +152,7 @@ function mapStage(message) {
   if (/提交密码/i.test(text)) return '验证 GPT 密码';
   if (/回调链/i.test(text)) return '生成 Session';
   if (/验证登录态/i.test(text)) return '验证 Session';
+  if (/取消续费|cancel-renewal|pre_cancel/i.test(text)) return '取消自动续费';
   if (/Cloudflare|authorize/i.test(text)) return '建立认证会话';
   if (/CSRF|登录认证/i.test(text)) return '连接 ChatGPT';
   if (/登录完成/i.test(text)) return '完成';
@@ -169,12 +171,54 @@ function isFailedRetryable(item) {
   return (item.status === 'failed' || item.status === 'cancelled') && hasRetryCredentials(item);
 }
 
+function publicCancelRenewal(result) {
+  if (!result || typeof result !== 'object') return null;
+  const {
+    accessToken, sessionToken, sessionJson, user, ...safe
+  } = result;
+  return safe;
+}
+
+function mergeCancelIntoSubscription(item) {
+  if (!item.cancelRenewal) return;
+  item.subscriptionInfo = item.subscriptionInfo || {};
+  item.subscriptionInfo.cancelRenewal = publicCancelRenewal(item.cancelRenewal);
+  if (item.cancelRenewal.ok && item.cancelRenewal.willRenew !== true && !item.cancelRenewal.skipped) {
+    item.subscriptionInfo.autoRenew = false;
+  }
+  if (item.cancelRenewal.ok === false && item.cancelRenewal.error) {
+    const warning = `取消自动续费失败：${item.cancelRenewal.error}`;
+    const warnings = item.subscriptionInfo.warnings || [];
+    if (!warnings.includes(warning)) item.subscriptionInfo.warnings = [...warnings, warning];
+  }
+}
+
+function applyCancelResult(item, cancelled) {
+  item.cancelRenewal = publicCancelRenewal(cancelled);
+  if (cancelled?.sessionToken) item.sessionToken = cancelled.sessionToken;
+  if (item.sessionData && (cancelled?.accessToken || cancelled?.sessionJson || cancelled?.sessionToken)) {
+    item.sessionData = {
+      ...item.sessionData,
+      accessToken: cancelled.accessToken || item.sessionData.accessToken,
+      sessionToken: cancelled.sessionToken || item.sessionToken,
+      sessionJson: cancelled.sessionJson || item.sessionData.sessionJson,
+      user: cancelled.user || item.sessionData.user,
+    };
+  }
+  if (cancelled?.accountId) item.accountId = cancelled.accountId;
+  mergeCancelIntoSubscription(item);
+}
+
 function serializeItem(item) {
   return {
     index: item.index,
     email: item.email,
     accountDisplay: item.accountDisplay,
     subscriptionInfo: item.subscriptionInfo || null,
+    cancelRenewal: publicCancelRenewal(item.cancelRenewal),
+    billingStatus: item.billingStatus || 'idle',
+    billingAction: item.billingAction || '',
+    billingError: item.billingError || '',
     status: item.status,
     stage: item.stage,
     error: item.error,
@@ -216,6 +260,7 @@ export function createBatchManager({
   waitForOTP,
   getAccessToken,
   getSubscriptionInfo = async () => null,
+  cancelRenewal = null,
   retentionMs = DEFAULT_RETENTION_MS,
   maxAccounts = DEFAULT_MAX_ACCOUNTS,
   now = () => Date.now(),
@@ -262,6 +307,10 @@ export function createBatchManager({
     item.sessionToken = '';
     item.sessionData = undefined;
     item.subscriptionInfo = null;
+    item.cancelRenewal = null;
+    item.billingStatus = 'idle';
+    item.billingAction = '';
+    item.billingError = '';
     item.startedAt = null;
     item.finishedAt = null;
   }
@@ -314,18 +363,24 @@ export function createBatchManager({
       } else {
         item.stage = '获取完整 Session 数据';
         const sessionData = await getSessionData(result.sessionToken, item.proxy);
-        item.sessionToken = result.sessionToken;
+        item.sessionToken = sessionData.sessionToken || result.sessionToken;
         item.sessionData = sessionData;
-        item.stage = '查询套餐信息';
-        try {
-          item.subscriptionInfo = await getSubscriptionInfo({
-            email: item.email,
-            accessToken: sessionData.accessToken,
-            accountId: result.accountId || sessionData.user?.accountId || null,
-            sessionJson: sessionData.sessionJson,
-          }, item.proxy);
-        } catch {
-          item.subscriptionInfo = { warnings: ['套餐信息暂不可用'] };
+        item.accountId = result.accountId || sessionData.user?.accountId || null;
+        if (job.cancelRenewal && typeof cancelRenewal === 'function') {
+          item.stage = '取消自动续费';
+          try {
+            const cancelled = await cancelRenewal({
+              email: item.email,
+              sessionToken: item.sessionToken,
+              accessToken: sessionData.accessToken,
+              accountId: item.accountId,
+              sessionJson: sessionData.sessionJson,
+            }, item.proxy);
+            applyCancelResult(item, cancelled);
+          } catch (error) {
+            item.cancelRenewal = { ok: false, error: publicError(error) };
+            mergeCancelIntoSubscription(item);
+          }
         }
         item.status = 'success';
         item.stage = '完成';
@@ -357,7 +412,7 @@ export function createBatchManager({
     await runItems(job, job.items);
   }
 
-  function create({ input, proxies = '', concurrency = 2 } = {}) {
+  function create({ input, proxies = '', concurrency = 2, cancelRenewal: cancelRenewalEnabled } = {}) {
     cleanup();
     const parsed = parseAccounts(input, { maxAccounts });
     const parsedProxies = parseProxyPool(proxies);
@@ -372,6 +427,7 @@ export function createBatchManager({
       createdAt: now(),
       finishedAt: null,
       concurrency: normalizedConcurrency,
+      cancelRenewal: cancelRenewalEnabled === true,
       proxies: parsedProxies.proxies,
       items: parsed.accounts.map((account) => ({
         ...account,
@@ -454,5 +510,120 @@ export function createBatchManager({
     return { ok: true, job: serializeJob(job) };
   }
 
-  return { create, get, cancel, retry, cleanup };
+  function resolveBillingTargets(job, { index, indexes, all } = {}) {
+    const eligible = (item) => item.status === 'success' && item.sessionData;
+    if (all === true) {
+      const targets = job.items.filter((item) => eligible(item) && item.billingStatus !== 'running');
+      if (!targets.length) {
+        const busy = job.items.some((item) => eligible(item) && item.billingStatus === 'running');
+        return { ok: false, status: busy ? 409 : 400, error: busy ? '已有套餐操作进行中' : '没有可操作的成功账号' };
+      }
+      return { ok: true, targets };
+    }
+    if (Array.isArray(indexes)) {
+      const seen = new Set();
+      const targets = [];
+      for (const raw of indexes) {
+        if (!Number.isInteger(raw) || raw < 0 || seen.has(raw)) continue;
+        seen.add(raw);
+        const item = job.items.find((entry) => entry.index === raw);
+        if (item && eligible(item) && item.billingStatus !== 'running') targets.push(item);
+      }
+      if (!targets.length) return { ok: false, status: 400, error: '没有可操作的成功账号' };
+      return { ok: true, targets };
+    }
+    if (Number.isInteger(index) && index >= 0) {
+      const item = job.items.find((entry) => entry.index === index);
+      if (!item) return { ok: false, status: 404, error: '账号不存在' };
+      if (!eligible(item)) return { ok: false, status: 400, error: '该账号还没有可用 Session' };
+      if (item.billingStatus === 'running') return { ok: false, status: 409, error: '该账号正在处理套餐操作' };
+      return { ok: true, targets: [item] };
+    }
+    return { ok: false, status: 400, error: '请指定要操作的账号' };
+  }
+
+  async function runBillingItem(item, action) {
+    item.billingStatus = 'running';
+    item.billingAction = action;
+    item.billingError = '';
+    const sessionData = item.sessionData;
+    try {
+      if (action === 'query') {
+        item.subscriptionInfo = await getSubscriptionInfo({
+          email: item.email,
+          accessToken: sessionData.accessToken,
+          accountId: item.accountId || item.cancelRenewal?.accountId || sessionData.user?.accountId || null,
+          sessionJson: sessionData.sessionJson,
+        }, item.proxy) || { warnings: ['套餐信息暂不可用'] };
+        mergeCancelIntoSubscription(item);
+      } else {
+        if (typeof cancelRenewal !== 'function') throw new Error('未配置取消续费能力');
+        const cancelled = await cancelRenewal({
+          email: item.email,
+          sessionToken: item.sessionToken || sessionData.sessionToken,
+          accessToken: sessionData.accessToken,
+          accountId: item.accountId || sessionData.user?.accountId || null,
+          sessionJson: sessionData.sessionJson,
+        }, item.proxy);
+        applyCancelResult(item, cancelled);
+      }
+      item.billingStatus = 'ok';
+    } catch (error) {
+      item.billingStatus = 'error';
+      item.billingError = publicError(error);
+      if (action === 'cancel') {
+        item.cancelRenewal = { ok: false, error: item.billingError };
+        mergeCancelIntoSubscription(item);
+      } else {
+        item.subscriptionInfo = {
+          ...(item.subscriptionInfo || {}),
+          warnings: [`套餐查询失败：${item.billingError}`],
+        };
+        mergeCancelIntoSubscription(item);
+      }
+    }
+  }
+
+  async function runBilling(job, targets, action) {
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(job.concurrency, targets.length) }, async () => {
+      while (cursor < targets.length) {
+        const item = targets[cursor++];
+        await runBillingItem(item, action);
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  function querySubscription(id, opts = {}) {
+    cleanup();
+    const job = jobs.get(id);
+    if (!job) return { ok: false, status: 404, error: '任务不存在或已清理' };
+    const resolved = resolveBillingTargets(job, opts);
+    if (!resolved.ok) return resolved;
+    for (const item of resolved.targets) {
+      item.billingStatus = 'running';
+      item.billingAction = 'query';
+      item.billingError = '';
+    }
+    void runBilling(job, resolved.targets, 'query');
+    return { ok: true, job: serializeJob(job) };
+  }
+
+  function cancelRenewalNow(id, opts = {}) {
+    cleanup();
+    const job = jobs.get(id);
+    if (!job) return { ok: false, status: 404, error: '任务不存在或已清理' };
+    const resolved = resolveBillingTargets(job, opts);
+    if (!resolved.ok) return resolved;
+    for (const item of resolved.targets) {
+      item.billingStatus = 'running';
+      item.billingAction = 'cancel';
+      item.billingError = '';
+    }
+    void runBilling(job, resolved.targets, 'cancel');
+    return { ok: true, job: serializeJob(job) };
+  }
+
+  return { create, get, cancel, retry, querySubscription, cancelRenewalNow, cleanup };
 }

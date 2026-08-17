@@ -1,6 +1,11 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeSubscriptionInfo } from '../src/gpt-subscription.js';
+import { normalizeSubscriptionInfo, chatgptAccountIdFromAccessToken, stableOaiId, cancelRenewal } from '../src/gpt-subscription.js';
+import { shutdownCycleTLS } from '../src/ctls.js';
+
+after(async () => {
+  await shutdownCycleTLS().catch(() => {});
+});
 
 test('normalizes active Plus subscription and masked payment details', () => {
   const now = Date.parse('2026-08-15T00:00:00Z');
@@ -173,4 +178,114 @@ test('guest accounts/check maps to free and marks billing as not applicable', ()
   assert.equal(info.autoRenew, null);
   assert.equal(info.billingApplicable, false);
   assert.equal(info.previouslyPaid, false);
+});
+
+function jwtWithAccount(accountId) {
+  const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    'https://api.openai.com/auth': { chatgpt_account_id: accountId },
+  })).toString('base64url');
+  return `${header}.${payload}.sig`;
+}
+
+test('extracts chatgpt_account_id from access token JWT', () => {
+  assert.equal(chatgptAccountIdFromAccessToken(jwtWithAccount('acc-123')), 'acc-123');
+  assert.equal(chatgptAccountIdFromAccessToken('not-a-jwt'), '');
+});
+
+test('stableOaiId is deterministic UUID-shaped', () => {
+  const first = stableOaiId('oai-device-', 'seed');
+  const second = stableOaiId('oai-device-', 'seed');
+  const other = stableOaiId('oai-device-', 'other');
+  assert.equal(first, second);
+  assert.notEqual(first, other);
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test('cancelRenewal refreshes session, posts cancel, and verifies will_renew', async () => {
+  const calls = [];
+  const access = jwtWithAccount('11111111-1111-1111-1111-111111111111');
+  const result = await cancelRenewal({
+    email: 'plus@example.com',
+    sessionToken: 'session-jwe',
+    accessToken: access,
+  }, 'http://proxy.example:8080', {
+    sleep: async () => {},
+    refreshSession: async (token, proxy, fp, reason) => {
+      calls.push({ type: 'refresh', token, proxy, reason });
+      return {
+        accessToken: access,
+        sessionToken: 'rotated-jwe',
+        sessionJson: JSON.stringify({ accessToken: access, sessionToken: 'rotated-jwe' }),
+        sessionRotated: true,
+      };
+    },
+    request: async (url, options = {}) => {
+      calls.push({ type: 'http', url, method: options.method || 'GET', body: options.body });
+      if (String(url).includes('/subscriptions/cancel')) {
+        return { status: 200, ok: true, body: { returned_amount: 0 }, text: '{}' };
+      }
+      if (String(url).includes('/subscriptions?')) {
+        return {
+          status: 200,
+          ok: true,
+          body: { will_renew: false, cancellation_outcome: 'deactivate', active_until: '2026-09-15T00:00:00Z', plan_type: 'plus' },
+          text: '{}',
+        };
+      }
+      throw new Error(`unexpected ${url}`);
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.willRenew, false);
+  assert.equal(result.cancellationOutcome, 'deactivate');
+  assert.equal(result.sessionToken, 'rotated-jwe');
+  assert.equal(calls.filter((call) => call.type === 'refresh')[0].reason, 'pre_cancel');
+  assert.equal(calls.some((call) => call.type === 'http' && String(call.url).includes('/subscriptions/cancel') && call.method === 'POST'), true);
+  assert.equal(calls.some((call) => call.type === 'http' && /accounts\/check/.test(call.url)), false);
+});
+
+test('cancelRenewal retries after 401 and treats missing subscription as skipped', async () => {
+  const access = jwtWithAccount('22222222-2222-2222-2222-222222222222');
+  let cancels = 0;
+  const result = await cancelRenewal({
+    sessionToken: 'session-jwe',
+    accessToken: access,
+  }, null, {
+    sleep: async () => {},
+    refreshSession: async (_token, _proxy, _fp, reason) => ({
+      accessToken: access,
+      sessionToken: `st-${reason}`,
+      sessionJson: JSON.stringify({ accessToken: access }),
+    }),
+    request: async (url) => {
+      if (String(url).includes('/subscriptions/cancel')) {
+        cancels += 1;
+        if (cancels === 1) return { status: 401, ok: false, body: {}, text: 'unauthorized' };
+        return { status: 400, ok: false, body: { detail: 'No active subscription' }, text: 'No active subscription' };
+      }
+      throw new Error(`unexpected ${url}`);
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.equal(cancels, 2);
+});
+
+test('cancelRenewal throws when verify still shows will_renew true', async () => {
+  const access = jwtWithAccount('33333333-3333-3333-3333-333333333333');
+  await assert.rejects(() => cancelRenewal({
+    sessionToken: 'session-jwe',
+    accessToken: access,
+  }, null, {
+    sleep: async () => {},
+    refreshSession: async () => ({ accessToken: access, sessionToken: 'session-jwe', sessionJson: '{}' }),
+    request: async (url) => {
+      if (String(url).includes('/subscriptions/cancel')) {
+        return { status: 200, ok: true, body: {}, text: '{}' };
+      }
+      return { status: 200, ok: true, body: { will_renew: true, cancellation_outcome: 'none' }, text: '{}' };
+    },
+  }), /will_renew 仍为 true/);
 });

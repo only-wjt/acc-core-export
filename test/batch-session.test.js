@@ -13,6 +13,15 @@ async function waitForDone(manager, id) {
   throw new Error('任务测试超时');
 }
 
+async function waitForBilling(manager, id) {
+  for (let i = 0; i < 100; i++) {
+    const job = manager.get(id);
+    if (job && !job.items.some((item) => item.billingStatus === 'running')) return job;
+    await wait(5);
+  }
+  throw new Error('套餐操作测试超时');
+}
+
 test('parseAccounts accepts email:password and passwords containing colons', () => {
   const result = parseAccounts('a@example.com:mail:a\r\n\r\nb@example.com:mail-b');
   assert.equal(result.errors.length, 0);
@@ -67,7 +76,8 @@ test('manager uses empty GPT password, fixed assigned proxy, and preserves sessi
   const job = await waitForDone(manager, created.job.id);
 
   assert.equal(job.counts.success, 2);
-  assert.equal(job.items[0].subscriptionInfo.plan, 'plus');
+  assert.equal(job.items[0].subscriptionInfo, null);
+  assert.equal(job.items[0].cancelRenewal, null);
   assert.deepEqual(job.sessions.map(JSON.parse).map((value) => value.accessToken), [
     'access-session-first@example.com',
     'access-session-third@example.com',
@@ -421,4 +431,122 @@ test('getAccessToken errors surface as the row error reason', async () => {
   assert.equal(job.items[0].status, 'failed');
   assert.equal(job.items[0].error, 'session 接口返回 403');
   assert.equal(job.items[0].canRetry, true);
+});
+
+test('session success does not auto query plan or cancel renewal', async () => {
+  let queried = false;
+  let cancelled = false;
+  const manager = createBatchManager({
+    waitForOTP: async () => '123456',
+    getAccessToken: async (token) => ({ accessToken: `access-${token}`, sessionJson: JSON.stringify({ token }) }),
+    getSubscriptionInfo: async () => {
+      queried = true;
+      return { plan: 'plus', autoRenew: true };
+    },
+    cancelRenewal: async () => {
+      cancelled = true;
+      return { ok: true, willRenew: false };
+    },
+    login: async (account) => ({ sessionToken: `session-${account.email}` }),
+  });
+  const created = manager.create({ input: 'a@example.com:mail1' });
+  const job = await waitForDone(manager, created.job.id);
+  assert.equal(job.items[0].status, 'success');
+  assert.equal(queried, false);
+  assert.equal(cancelled, false);
+  assert.equal(job.items[0].subscriptionInfo, null);
+  assert.equal(job.items[0].cancelRenewal, null);
+});
+
+test('querySubscription writes plan without failing the session row', async () => {
+  const manager = createBatchManager({
+    waitForOTP: async () => '123456',
+    getAccessToken: async (token) => ({
+      accessToken: `access-${token}`,
+      sessionJson: JSON.stringify({ accessToken: `access-${token}` }),
+      sessionToken: token,
+    }),
+    getSubscriptionInfo: async ({ email }, proxy) => ({ plan: 'plus', autoRenew: true, email, proxy }),
+    login: async (account, options) => ({ sessionToken: `session-${account.email}`, accountId: 'acc-1' }),
+  });
+  const created = manager.create({
+    input: 'plus@example.com:mail1',
+    proxies: 'http://u:p@proxy.example:8080',
+  });
+  await waitForDone(manager, created.job.id);
+  const queried = manager.querySubscription(created.job.id, { index: 0 });
+  assert.equal(queried.ok, true);
+  assert.equal(queried.job.items[0].billingStatus, 'running');
+  const job = await waitForBilling(manager, created.job.id);
+  assert.equal(job.items[0].status, 'success');
+  assert.equal(job.items[0].subscriptionInfo.plan, 'plus');
+  assert.equal(job.items[0].billingStatus, 'ok');
+});
+
+test('cancelRenewalNow rotates session json and does not fail the row on error', async () => {
+  const calls = [];
+  let shouldFail = false;
+  const manager = createBatchManager({
+    waitForOTP: async () => '123456',
+    getAccessToken: async (token) => ({
+      accessToken: `access-${token}`,
+      sessionJson: JSON.stringify({ accessToken: `access-${token}` }),
+      sessionToken: token,
+    }),
+    cancelRenewal: async (creds, proxy) => {
+      calls.push({ email: creds.email, accessToken: creds.accessToken, proxy });
+      if (shouldFail) throw new Error('取消续费失败: 500 boom');
+      return {
+        ok: true,
+        willRenew: false,
+        accountId: 'acc-1',
+        accessToken: 'access-rotated',
+        sessionToken: 'session-rotated',
+        sessionJson: JSON.stringify({ accessToken: 'access-rotated', sessionToken: 'session-rotated' }),
+      };
+    },
+    login: async (account) => ({ sessionToken: `session-${account.email}`, accountId: 'acc-1' }),
+  });
+
+  const created = manager.create({
+    input: 'plus@example.com:mail1',
+    proxies: 'http://u:p@proxy.example:8080',
+  });
+  await waitForDone(manager, created.job.id);
+  const cancelled = manager.cancelRenewalNow(created.job.id, { all: true });
+  assert.equal(cancelled.ok, true);
+  const job = await waitForBilling(manager, created.job.id);
+  assert.equal(job.items[0].status, 'success');
+  assert.equal(job.items[0].cancelRenewal.ok, true);
+  assert.equal(job.items[0].subscriptionInfo.autoRenew, false);
+  assert.equal(JSON.parse(job.sessions[0]).sessionToken, 'session-rotated');
+  assert.equal(calls[0].email, 'plus@example.com');
+  assert.equal(calls[0].proxy, 'http://u:p@proxy.example:8080');
+  assert.doesNotMatch(JSON.stringify(job.items[0].cancelRenewal), /access-rotated|session-rotated/);
+
+  shouldFail = true;
+  const failed = manager.cancelRenewalNow(created.job.id, { index: 0 });
+  assert.equal(failed.ok, true);
+  const after = await waitForBilling(manager, created.job.id);
+  assert.equal(after.items[0].status, 'success');
+  assert.equal(after.items[0].cancelRenewal.ok, false);
+  assert.match(after.items[0].subscriptionInfo.warnings.join(''), /取消自动续费失败/);
+});
+
+test('explicit cancelRenewal:true still auto-cancels after login', async () => {
+  let cancelled = false;
+  const manager = createBatchManager({
+    waitForOTP: async () => '123456',
+    getAccessToken: async (token) => ({ accessToken: `access-${token}`, sessionJson: JSON.stringify({ token }) }),
+    cancelRenewal: async () => {
+      cancelled = true;
+      return { ok: true, willRenew: false };
+    },
+    login: async (account) => ({ sessionToken: `session-${account.email}` }),
+  });
+  const created = manager.create({ input: 'a@example.com:mail1', cancelRenewal: true });
+  const job = await waitForDone(manager, created.job.id);
+  assert.equal(job.items[0].status, 'success');
+  assert.equal(cancelled, true);
+  assert.equal(job.items[0].cancelRenewal.ok, true);
 });

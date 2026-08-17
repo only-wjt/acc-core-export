@@ -12,6 +12,8 @@ const sessionList = document.querySelector('#sessionList');
 const copyButton = document.querySelector('#copyButton');
 const downloadButton = document.querySelector('#downloadButton');
 const exportExcelButton = document.querySelector('#exportExcelButton');
+const queryAllPlansButton = document.querySelector('#queryAllPlansButton');
+const cancelAllRenewalButton = document.querySelector('#cancelAllRenewalButton');
 const copyFailedButton = document.querySelector('#copyFailedButton');
 const retryFailedButton = document.querySelector('#retryFailedButton');
 const retrySelectedButton = document.querySelector('#retrySelectedButton');
@@ -242,7 +244,9 @@ function escapeHtml(value) {
 }
 
 function formatSubscription(info) {
-  if (!info) return '<div class="subscription-unavailable">套餐信息暂不可用</div>';
+  if (!info || (!info.plan && !info.cancelRenewal && !info.warnings?.length)) {
+    return '';
+  }
   const missing = info.billingApplicable === false ? '免费账号无此项' : '未提供';
   const date = (value) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : missing;
   const remaining = info.remainingMs == null ? missing : `${Math.floor(info.remainingMs / 86400000)} 天 ${Math.floor((info.remainingMs % 86400000) / 3600000)} 小时`;
@@ -260,6 +264,15 @@ function formatSubscription(info) {
   const periodLabel = info.billingPeriod === 'year' || info.billingPeriod === 'yearly' ? '年付'
     : info.billingPeriod === 'month' || info.billingPeriod === 'monthly' ? '月付'
       : info.billingPeriod || missing;
+  const cancel = info.cancelRenewal;
+  let cancelLabel = '未执行';
+  if (cancel?.ok && cancel.skipped) cancelLabel = cancel.message || '已跳过';
+  else if (cancel?.ok && cancel.optimistic) cancelLabel = '已发送取消请求（验证跳过）';
+  else if (cancel?.ok && cancel.willRenew !== true) cancelLabel = cancel.activeUntil
+    ? `已取消，权益保留至 ${new Date(cancel.activeUntil).toLocaleString('zh-CN', { hour12: false })}`
+    : '已取消，到期后不续费';
+  else if (cancel?.ok === false) cancelLabel = cancel.error || '取消失败';
+  else if (info.autoRenew === false) cancelLabel = '到期后不续费';
   return `
     <div class="subscription-grid">
       <span>当前套餐</span><strong>${escapeHtml(String(info.plan || '未知').toUpperCase())}</strong>
@@ -268,6 +281,7 @@ function formatSubscription(info) {
       <span>到期时间</span><strong>${escapeHtml(date(info.periodEnd))}</strong>
       <span>剩余</span><strong>${escapeHtml(remaining)}</strong>
       <span>自动续费</span><strong>${info.autoRenew == null ? missing : info.autoRenew ? '已开启' : '到期后不续费'}</strong>
+      <span>取消续费</span><strong>${escapeHtml(cancelLabel)}</strong>
       <span>计费周期</span><strong>${escapeHtml(periodLabel)}</strong>
       <span>最近付款</span><strong>${escapeHtml(amount)}${info.lastPaymentAt ? ` · ${escapeHtml(date(info.lastPaymentAt))}` : ''}</strong>
       <span>历史付费</span><strong>${info.previouslyPaid == null ? '未提供' : info.previouslyPaid ? '曾付费' : '从未付费'}</strong>
@@ -336,19 +350,35 @@ function renderJob(job) {
 
   const successfulItems = job.items.filter((item) => item.status === 'success').sort((a, b) => a.index - b.index);
   sessionList.innerHTML = successfulItems.length
-    ? successfulItems.map((item, index) => `
+    ? successfulItems.map((item, index) => {
+      const busy = item.billingStatus === 'running';
+      const queryLabel = busy && item.billingAction === 'query' ? '查询中' : '查询套餐';
+      const cancelLabel = busy && item.billingAction === 'cancel' ? '取消中' : '取消自动续费';
+      const planHtml = formatSubscription(item.subscriptionInfo);
+      const errorHtml = item.billingError && item.billingStatus === 'error'
+        ? `<p class="session-billing-note is-error">${escapeHtml(item.billingError)}</p>`
+        : '';
+      return `
       <article class="session-item">
-        <div class="session-meta"><span>#${index + 1}</span><strong>${escapeHtml(item.accountDisplay || item.email)}</strong></div>
-        <div class="session-detail">
-          ${formatSubscription(item.subscriptionInfo)}
-          <code class="session-token">${escapeHtml(job.sessions[index] || '')}</code>
-        </div>
-      </article>
-    `).join('')
+        <header class="session-head">
+          <div class="session-meta"><span>#${index + 1}</span><strong>${escapeHtml(item.accountDisplay || item.email)}</strong></div>
+          <div class="session-billing-actions">
+            <button class="icon-text-button" type="button" data-billing="query" data-index="${item.index}" ${busy ? 'disabled' : ''}>${queryLabel}</button>
+            <button class="icon-text-button" type="button" data-billing="cancel" data-index="${item.index}" ${busy ? 'disabled' : ''}>${cancelLabel}</button>
+          </div>
+        </header>
+        ${planHtml ? `<div class="session-plan">${planHtml}</div>` : ''}
+        ${errorHtml}
+        <code class="session-token">${escapeHtml(job.sessions[index] || '')}</code>
+      </article>`;
+    }).join('')
     : '<p class="session-empty">成功获取的 Session 将在这里逐条显示。</p>';
   const hasResults = job.sessions.length > 0;
+  const billingBusyNow = billingBusy(job);
   copyButton.disabled = !hasResults;
   downloadButton.disabled = !hasResults;
+  if (queryAllPlansButton) queryAllPlansButton.disabled = !hasResults || billingBusyNow;
+  if (cancelAllRenewalButton) cancelAllRenewalButton.disabled = !hasResults || billingBusyNow;
   if (hasResults) {
     copyButton.dataset.sessions = job.sessions.join('\n');
   }
@@ -376,6 +406,10 @@ function stopPolling() {
   pollTimer = null;
 }
 
+function billingBusy(job = lastJob) {
+  return (job?.items || []).some((item) => item.billingStatus === 'running');
+}
+
 async function pollJob() {
   pollTimer = null;
   if (!currentJobId) return;
@@ -385,10 +419,16 @@ async function pollJob() {
     if (job.status === 'running') {
       setJobRunning(true);
       pollTimer = setTimeout(pollJob, 800);
-    } else {
+    } else if (billingBusy(job)) {
       setJobRunning(false);
-      showToast(job.status === 'cancelled' ? '任务已取消' : `处理完成：成功 ${job.counts.success}，失败 ${job.counts.failed}`);
-      void loadHistory();
+      pollTimer = setTimeout(pollJob, 800);
+    } else {
+      const loginJustFinished = jobRunning;
+      setJobRunning(false);
+      if (loginJustFinished) {
+        showToast(job.status === 'cancelled' ? '任务已取消' : `处理完成：成功 ${job.counts.success}，失败 ${job.counts.failed}`);
+        void loadHistory();
+      }
     }
   } catch (error) {
     if (/不存在|已清理/.test(error.message)) {
@@ -443,12 +483,17 @@ startButton.addEventListener('click', async () => {
   copyButton.disabled = true;
   downloadButton.disabled = true;
   exportExcelButton.disabled = true;
+  if (queryAllPlansButton) queryAllPlansButton.disabled = true;
+  if (cancelAllRenewalButton) cancelAllRenewalButton.disabled = true;
   statusSummary.textContent = '正在创建任务';
 
   try {
     const job = await request('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ input: accounts.value, ...adminConcurrency(concurrency) }),
+      body: JSON.stringify({
+        input: accounts.value,
+        ...adminConcurrency(concurrency),
+      }),
     });
     rememberJob(job.id);
     renderJob(job);
@@ -470,6 +515,49 @@ cancelButton.addEventListener('click', async () => {
     showToast('已发送取消请求');
   } catch (error) {
     showToast(error.message);
+  }
+});
+
+async function runBilling(path, payload, toastMessage) {
+  if (!currentJobId) return;
+  try {
+    const job = await request(`/api/jobs/${currentJobId}/${path}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    renderJob(job);
+    ensurePolling();
+    if (toastMessage) showToast(toastMessage);
+  } catch (error) {
+    showToast(error.message);
+    if (lastJob) renderJob(lastJob);
+  }
+}
+
+queryAllPlansButton?.addEventListener('click', () => {
+  const count = lastJob?.items.filter((item) => item.status === 'success').length || 0;
+  if (!count) return;
+  void runBilling('subscription', { all: true }, `正在查询 ${count} 个账号的套餐`);
+});
+
+cancelAllRenewalButton?.addEventListener('click', () => {
+  const count = lastJob?.items.filter((item) => item.status === 'success').length || 0;
+  if (!count) return;
+  if (!window.confirm(`将对 ${count} 个已成功账号取消自动续费，确定继续？`)) return;
+  void runBilling('cancel-renewal', { all: true }, `正在取消 ${count} 个账号的自动续费`);
+});
+
+sessionList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-billing]');
+  if (!button || button.disabled) return;
+  const index = Number(button.dataset.index);
+  if (!Number.isInteger(index) || index < 0) return;
+  if (button.dataset.billing === 'query') {
+    void runBilling('subscription', { index }, '正在查询套餐');
+    return;
+  }
+  if (button.dataset.billing === 'cancel') {
+    void runBilling('cancel-renewal', { index }, '正在取消自动续费');
   }
 });
 

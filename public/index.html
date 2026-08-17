@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>ACC 工作台</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 42 42'><rect width='42' height='42' rx='12' fill='%23c9a36a' fill-opacity='0.12'/><rect width='42' height='42' rx='12' fill='none' stroke='%23c9a36a' stroke-width='1'/><circle cx='21' cy='15' r='5' fill='none' stroke='%23c9a36a' stroke-width='1.6'/><rect x='19.5' y='21' width='3' height='10' rx='1' fill='%23c9a36a'/></svg>">
-  <link rel="stylesheet" href="/styles.css?v=7">
+  <link rel="stylesheet" href="/styles.css?v=10">
   <script src="/theme.js?v=2"></script>
 </head>
 <body>
@@ -87,7 +87,7 @@
           <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11"/></svg>
           取消任务
         </button>
-        <p class="action-note">每个账号随机固定使用一条代理，并通过邮箱验证码登录 GPT。代理由管理员统一配置。</p>
+        <p class="action-note">每个账号随机固定使用一条代理，并通过邮箱验证码登录 GPT。代理由管理员统一配置。套餐查询和取消续费在拿到 Session 后手动操作。</p>
       </div>
     </section>
 
@@ -141,6 +141,8 @@
           <h2 id="result-title">Session 输出</h2>
         </div>
         <div class="result-actions">
+          <button class="icon-text-button" id="queryAllPlansButton" type="button" disabled>查询全部套餐</button>
+          <button class="icon-text-button" id="cancelAllRenewalButton" type="button" disabled>取消全部自动续费</button>
           <button class="icon-text-button copy-all-button" id="copyButton" type="button" disabled>
             <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="1"/><path d="M16 8V5H5v11h3"/></svg>
             一键复制全部
@@ -605,6 +607,6 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js?v=7"></script>
+  <script type="module" src="/app.js?v=10"></script>
 </body>
 </html>

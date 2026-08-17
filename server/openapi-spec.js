@@ -40,11 +40,12 @@ export function getOpenApiDocs({
         method: 'POST',
         path: '/openapi/v1/sessions',
         auth: true,
-        summary: '批量取 Session，立即返回任务 id，再轮询',
+        summary: '批量取 Session，立即返回任务 id，再轮询。默认不自动取消续费',
         body: {
           accounts: [
             { email: 'a@mail.com', gptPassword: 'gpt密码', mailPassword: '邮箱密码' },
           ],
+          cancelRenewal: false,
         },
         altBody: { input: 'a@mail.com----gpt密码----邮箱密码' },
         response: {

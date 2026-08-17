@@ -65,6 +65,8 @@ POST /openapi/v1/sessions
 }
 ```
 
+默认只取 Session，不自动查套餐、不自动取消续费。需要随任务取消续费时再传 `"cancelRenewal": true`。
+
 也兼容工作台那行文本：
 
 ```json

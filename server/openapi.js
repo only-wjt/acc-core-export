@@ -130,6 +130,7 @@ export function createOpenApi({
       input,
       proxies: adminSettings.get().proxyText,
       concurrency: Math.max(1, Math.min(apiKeys.concurrencyLimit, key.concurrency)),
+      cancelRenewal: body?.cancelRenewal === true,
     });
     if (result.ok) jobOwners.set(result.job.id, key.owner);
     return result.ok

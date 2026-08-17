@@ -1,5 +1,5 @@
 // 邮箱模块(HTTP 协议):纯 HTTP 逆向 mail.com Web API，无需 IMAP。
-// 流程：login(3-step) → sid+cookie → OAuth token(Basic auth) → Bearer token 访问邮件 API。
+// 流程：login(3-step) → sid+cookie → SPA OAuth token → Bearer/no_cache 访问邮件 API。
 // 注意：mail.com 做 JA3/JA4 TLS 指纹检测。使用 undici Pool + Chrome 密码套件顺序绕过。
 
 import { ctlsFetch, pickFingerprint, applyFp, UA } from './ctls.js';
@@ -18,14 +18,16 @@ import {
 async function chromeFetch(url, opts = {}) {
   const fp = opts.fp || null;
   const hdrs = applyFp({ 'User-Agent': fp?.ua || UA, ...(opts.headers || {}) }, fp);
+  const method = opts.method || 'GET';
+  const hasBody = opts.body != null && opts.body !== '';
   return ctlsFetch(url, {
-    method: opts.method || 'GET',
+    method,
     headers: hdrs,
     body: opts.body || undefined,
     ja3: fp?.ja3,
     ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
-    ...(opts.forceHTTP1 ? { forceHTTP1: true } : {}),
-    // mail.js 所有重定向均由上层代码手动处理(与原 undici maxRedirections=0 行为一致)
+    // mail.com 带 body 的 POST 在 HTTP/2 上会丢请求体/卡死，登录和取信都强制 HTTP/1.1
+    forceHTTP1: opts.forceHTTP1 || hasBody || undefined,
     redirect: opts.redirect === 'follow' ? 'follow' : 'manual',
   }, opts.proxy || null);
 }
@@ -37,6 +39,16 @@ const CLIENT_ID = 'mailcom_webmailermaillist_passport_live';
 const CLIENT_SECRET = '*******';
 
 const sessions = new Map();
+
+function extractAuthId(accessToken) {
+  try {
+    const jwt = accessToken.startsWith('q') ? accessToken.slice(1) : accessToken;
+    const payload = jwt.split('.')[1];
+    const padded = payload + '='.repeat((4 - payload.length % 4) % 4);
+    const decoded = JSON.parse(Buffer.from(padded, 'base64url').toString());
+    return decoded.auth_id || null;
+  } catch { return null; }
+}
 
 // ── 代理轮转池（mail.com 登录分摊到多个出口 IP，避免单 IP 触发限流）──
 let _loginProxies = [];
@@ -69,6 +81,14 @@ async function timedStep(tag, fn) {
   finally { console.log(`[mail] ${tag} ${((Date.now() - t0) / 1000).toFixed(2)}s`); }
 }
 
+function headerLocation(resp) {
+  return String(resp?.headers?.get('location') || resp?.headers?.get('Location') || '').trim();
+}
+
+function isNavigatorUrl(location) {
+  return /navigator-lx[a-z]\.mail\.com/i.test(location || '');
+}
+
 async function doLogin(email, password, proxy, fp = null) {
   const form = new URLSearchParams({
     service: 'mailint',
@@ -83,7 +103,7 @@ async function doLogin(email, password, proxy, fp = null) {
     password: password,
   });
 
-  // Step 1: POST credentials → 303 redirect to navigator
+  // Step 1: POST credentials → 302/303 redirect to navigator
   const step1 = await timedStep(`#${email} login`, () => chromeFetch('https://login.mail.com/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -92,38 +112,35 @@ async function doLogin(email, password, proxy, fp = null) {
     proxy, fp, timeoutMs: LOGIN_STEP_TIMEOUT_MS,
   }));
 
-  if (step1.status !== 303) {
-    const body = await step1.text().catch(() => '');
-    // mail.com 风控：直连/脏 IP 常返回 403 {"message":"blocked"} —— 不是坏密，换住宅代理可救
-    if (step1.status === 403 && /"message"\s*:\s*"blocked"|blocked/i.test(body)) {
-      throw new Error('mail_blocked: login.mail.com 403 blocked(出口IP被拒,换代理重试)');
-    }
-    if (step1.status === 429 || /rate.?limit|too many/i.test(body)) {
-      throw new Error(`mail_rate_limited: login 限流(${step1.status})`);
-    }
-    if (step1.status === 302 && /assistance|support\.mail\.com/i.test(body + (step1.headers.get('location') || ''))) {
-      throw new Error('mail_sms_locked: mail.com 账户协助/风控页(assistance,需人工)');
-    }
-    throw new Error(`Login failed: status ${step1.status}${body ? ` ${body.slice(0, 150)}` : ''}`);
-  }
+  const location = headerLocation(step1);
+  const body = (!isNavigatorUrl(location) || (step1.status !== 302 && step1.status !== 303))
+    ? await step1.text().catch(() => '')
+    : '';
 
-  const location = step1.headers.get('location');
-  if (location && location.includes('interception-lxa.mail.com')) {
+  if (step1.status === 403 && /"message"\s*:\s*"blocked"|blocked/i.test(body)) {
+    throw new Error('mail_blocked: login.mail.com 403 blocked(出口IP被拒,换代理重试)');
+  }
+  if (step1.status === 429 || /rate.?limit|too many/i.test(body)) {
+    throw new Error(`mail_rate_limited: login 限流(${step1.status})`);
+  }
+  if (/interception-lx[a-z]\.mail\.com/i.test(location)) {
     throw new Error('mail_sms_locked: 账号触发手机验证(mail.com安全拦截)');
   }
-  if (location && /support\.mail\.com|assistance/i.test(location)) {
+  if (/support\.mail\.com|assistance/i.test(location + body)) {
     throw new Error('mail_sms_locked: mail.com 账户协助/风控页(需人工)');
   }
-  if (!location || !location.includes('navigator-lxa.mail.com')) {
-    // ls=wd 才是真坏密
-    if (location && /[?&]ls=wd\b/i.test(location)) {
-      throw new Error('bad_password: 密码错误(登录被拒 ls=wd)');
-    }
-    throw new Error(`Login failed: unexpected redirect target ${location || ''}`);
+  if (/[?&]ls=wd\b/i.test(location)) {
+    throw new Error('bad_password: 密码错误(登录被拒 ls=wd)');
+  }
+  if ((step1.status !== 302 && step1.status !== 303) || !isNavigatorUrl(location)) {
+    console.log(`[mail] #${email} login unexpected status=${step1.status} loc=${location.slice(0, 180)}`);
+    throw new Error(`Login failed: status ${step1.status}${location ? ` loc=${location.slice(0, 120)}` : ''}${body ? ` ${body.slice(0, 150)}` : ''}`);
   }
 
+  const navigatorUrl = location.startsWith('http') ? location : new URL(location, 'https://login.mail.com').href;
+
   // Step 2: GET /login on navigator → 200 HTML with FeatureDetection JSON
-  const step2 = await timedStep(`#${email} navigator`, () => chromeFetch(location, {
+  const step2 = await timedStep(`#${email} navigator`, () => chromeFetch(navigatorUrl, {
     headers: {},
     redirect: 'manual',
     proxy, fp, timeoutMs: LOGIN_STEP_TIMEOUT_MS,
@@ -135,19 +152,20 @@ async function doLogin(email, password, proxy, fp = null) {
   const redirectUrl = JSON.parse(fdMatch[1]).redirectUrl;
   if (!redirectUrl) throw new Error('Login failed: no redirectUrl in FeatureDetection');
 
-  // Step 3: GET /halogin → 302 with sid + navigator cookie
+  const navigatorOrigin = new URL(navigatorUrl).origin;
+  const haloginUrl = /^https?:/i.test(redirectUrl) ? redirectUrl : `${navigatorOrigin}${redirectUrl}`;
   const step1Cookies = (step1.headers.getSetCookie?.() || []).map(c => c.split(';')[0]).join('; ');
-  const step3 = await timedStep(`#${email} halogin`, () => chromeFetch(`https://navigator-lxa.mail.com${redirectUrl}`, {
+  const step3 = await timedStep(`#${email} halogin`, () => chromeFetch(haloginUrl, {
     headers: { 'Cookie': step1Cookies },
     redirect: 'manual',
     proxy, fp, timeoutMs: LOGIN_STEP_TIMEOUT_MS,
   }));
 
-  if (step3.status !== 302) {
+  if (step3.status !== 302 && step3.status !== 303) {
     throw new Error(`halogin failed: status ${step3.status}`);
   }
 
-  const haloginLoc = step3.headers.get('location') || '';
+  const haloginLoc = headerLocation(step3);
   const sidMatch = haloginLoc.match(/sid=([a-f0-9]+)/);
   if (!sidMatch) throw new Error('Failed to extract sid from halogin redirect');
 
@@ -155,13 +173,14 @@ async function doLogin(email, password, proxy, fp = null) {
   const navCookie = cookies.find(c => c.startsWith('navigator='))?.split(';')[0] || '';
   if (!navCookie) throw new Error('Failed to get navigator cookie');
 
-  return { sid: sidMatch[1], navCookie, step1Cookies };
+  return { sid: sidMatch[1], navCookie, step1Cookies, navigatorHost: new URL(navigatorUrl).hostname };
 }
 
-async function getToken(sid, navCookie, scope = 'mail_mailbox_r', proxy, fp = null) {
+async function getToken(sid, navCookie, scope = 'mail_mailbox_r', proxy, fp = null, navigatorHost = 'navigator-lxa.mail.com') {
   const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+  const host = String(navigatorHost || 'navigator-lxa.mail.com').replace(/^https?:\/\//, '');
   const resp = await timedStep(`#${String(sid).slice(0, 6)} token`, () => chromeFetch(
-    `https://oauthbridge.navigator-lxa.mail.com/navigator/oauth2/token?sid=${sid}`,
+    `https://oauthbridge.${host}/navigator/oauth2/token?sid=${sid}`,
     {
       method: 'POST',
       headers: {
@@ -169,7 +188,7 @@ async function getToken(sid, navCookie, scope = 'mail_mailbox_r', proxy, fp = nu
         'Authorization': `Basic ${basic}`,
         'Cookie': navCookie,
         'Origin': 'https://webmailer.mail.com',
-        'x-ui-app': 'mailcom.webmailer.mail-list/6.0.0',
+        'x-ui-app': 'mailcom.webmailer.mail-list/6.6.3',
       },
       body: `grant_type=urn:mam:oauth:grant-type:spa&scope=${encodeURIComponent(scope)}`,
       proxy, fp, timeoutMs: LOGIN_STEP_TIMEOUT_MS,
@@ -185,7 +204,9 @@ async function getToken(sid, navCookie, scope = 'mail_mailbox_r', proxy, fp = nu
 }
 
 function proxyKey(p) {
-  return p ? `${p.host}:${p.port}:${p.username}` : 'direct';
+  if (!p) return 'direct';
+  if (typeof p === 'string') return p;
+  return `${p.host}:${p.port}:${p.username}`;
 }
 
 // 登录限流:login.mail.com 对高并发自动化登录敏感(会在 halogin 步静默拒绝/转人工验证),
@@ -237,8 +258,9 @@ async function getSession(email, password, proxy) {
 
   if (session && session.sid && session.navCookie) {
     try {
-      const tokenResp = await getToken(session.sid, session.navCookie, undefined, proxy, fp);
+      const tokenResp = await getToken(session.sid, session.navCookie, undefined, proxy, fp, session.navigatorHost);
       session.accessToken = tokenResp.access_token;
+      session.authId = extractAuthId(tokenResp.access_token) || session.authId;
       session.expiresIn = tokenResp.expires_in;
       session.tokenTime = Date.now();
       session.ssoCreatedAt = Date.now();
@@ -255,23 +277,26 @@ async function getSession(email, password, proxy) {
     try {
       loginResult = await doLogin(email, password, proxy, fp);
     } catch (e) {
-      // 失败是即时确定信号:短暂退避(清微限流)后立即重试,不再固定死等 1.5s。
+      const msg = String(e?.message || e);
+      if (/bad_password|sms_locked|mail_blocked|mail_rate_limited/i.test(msg)) throw e;
       await sleep(Number(process.env.MAIL_LOGIN_RETRY_MS) || 400);
       loginResult = await doLogin(email, password, proxy, fp);
     }
   } finally {
     releaseLoginSlot();
   }
-  const { sid, navCookie, step1Cookies } = loginResult;
-  const tokenResp = await getToken(sid, navCookie, undefined, proxy, fp);
+  const { sid, navCookie, step1Cookies, navigatorHost } = loginResult;
+  const tokenResp = await getToken(sid, navCookie, undefined, proxy, fp, navigatorHost);
   session = {
     sid,
     navCookie,
     step1Cookies,
+    navigatorHost,
     ssoCreatedAt: Date.now(),
     password,
     proxyKey: proxyKey(proxy),
     accessToken: tokenResp.access_token,
+    authId: extractAuthId(tokenResp.access_token),
     expiresIn: tokenResp.expires_in,
     tokenTime: Date.now(),
   };
@@ -358,10 +383,10 @@ export async function checkMailAlive(email, password, proxy = null) {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(), redirect: 'manual', proxy, fp, timeoutMs: LOGIN_STEP_TIMEOUT_MS,
     }));
-    const loc = r.headers.get('location') || '';
-    if (r.status === 303 || (r.status >= 300 && r.status < 400 && loc)) {
-      if (loc.includes('navigator-lxa')) return { alive: true, reason: 'online' };
-      if (loc.includes('interception-lxa') || /interception|sms|phone.?verif/i.test(loc)) {
+    const loc = headerLocation(r);
+    if (r.status === 303 || r.status === 302 || (r.status >= 300 && r.status < 400 && loc)) {
+      if (isNavigatorUrl(loc)) return { alive: true, reason: 'online' };
+      if (/interception-lx[a-z]\.mail\.com/i.test(loc) || /interception|sms|phone.?verif/i.test(loc)) {
         return { alive: false, reason: 'sms_locked', error: 'SMS安全锁(需手动解锁,非死号)' };
       }
       if (/support\.mail\.com|assistance/i.test(loc)) {
@@ -375,7 +400,7 @@ export async function checkMailAlive(email, password, proxy = null) {
         return { alive: false, reason: 'login_error', error: '登录错误(ls=te)' };
       }
       // 明确注销/失败页也当凭据问题
-      if (/logout|loginFailed|unauthorized/i.test(loc) && !loc.includes('navigator-lxa')) {
+      if (/logout|loginFailed|unauthorized/i.test(loc) && !isNavigatorUrl(loc)) {
         return { alive: false, reason: 'bad_password', error: `登录失败跳转: ${loc.slice(0, 80)}` };
       }
       return { alive: false, reason: 'error', error: `未知跳转: ${loc.slice(0, 80)}` };
@@ -417,7 +442,6 @@ export async function listMail(email, password, { page = 0, size = 50, folder = 
   const session = await getSession(email, password, proxy);
   const fp = pickFingerprint(email);
   const offset = page * size;
-  const url = `https://maillist.mail.com/Mailbox/Mail?folderTypeOrId=${folder}&offset=${offset}&amount=${size}&orderBy=INTERNALDATE+DESC`;
 
   const body = {
     aditionContext: { brand: 'mailcom', category: 'mail', section: '3c/folder', tagid: 'inline', layoutclass: 'b' },
@@ -426,24 +450,28 @@ export async function listMail(email, password, { page = 0, size = 50, folder = 
     mailboxContext: { currentPage: page + 1, visibleMessages: size },
   };
 
-  const makeMaillistReq = (token) => chromeFetch(url, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/vnd.1and1.mms.unified-maillist-v1+json; charset=utf-8',
-      'Content-Type': 'application/vnd.1and1.mms.inboxadrequest-v1+json; charset=utf-8',
-      'Authorization': `Bearer ${token}`,
-      'x-ui-app': 'mailcom.webmailer.mail-list/6.0.0',
-      'Origin': 'https://webmailer.mail.com',
-    },
-    body: JSON.stringify(body),
-    proxy, fp,
-  });
+  const makeMaillistReq = (s) => {
+    const nc = s.authId || '';
+    return chromeFetch(
+      `https://maillist.mail.com/Mailbox/Mail?folderTypeOrId=${folder}&offset=${offset}&amount=${size}&orderBy=INTERNALDATE+DESC&no_cache=${nc}`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/vnd.1and1.mms.unified-maillist-v1+json; charset=utf-8',
+        'Content-Type': 'application/vnd.1and1.mms.inboxadrequest-v1+json; charset=utf-8',
+        'Authorization': `Bearer ${s.accessToken}`,
+        'x-ui-app': 'mailcom.webmailer.mail-list/6.6.3',
+        'Origin': 'https://webmailer.mail.com',
+      },
+      body: JSON.stringify(body),
+      proxy, fp,
+    });
+  };
 
-  let resp = await makeMaillistReq(session.accessToken);
+  let resp = await makeMaillistReq(session);
   if (resp.status === 401) {
     sessions.delete(email.toLowerCase());
     const fresh = await getSession(email, password, proxy);
-    resp = await makeMaillistReq(fresh.accessToken);
+    resp = await makeMaillistReq(fresh);
   }
   if (!resp.ok) throw new Error(`Maillist API failed: ${resp.status}`);
   const data = await resp.json();
@@ -473,26 +501,27 @@ export async function listMail(email, password, { page = 0, size = 50, folder = 
 export async function getBody(email, password, mailId, proxy) {
   const session = await getSession(email, password, proxy);
   const fp = pickFingerprint(email);
-  const url = `https://mailcom.mailbody-ui.de/Mail/${mailId}/Body/html?target_origin=${encodeURIComponent('https://webmailer.mail.com')}`;
 
-  const makeBodyReq = (token) => chromeFetch(url, {
-    method: 'POST',
-    headers: {
-      'Accept': 'text/html, */*',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Authorization': `Bearer ${token}`,
-      'x-ui-app': 'mailcom.webmailer.mail-body/3.0.0',
-      'Origin': 'https://webmailer.mail.com',
-    },
-    body: '',
-    proxy, fp,
-  });
+  const makeBodyReq = (s) => {
+    const nc = s.authId || '';
+    return chromeFetch(
+      `https://mailcom.mailbody-ui.de/Mail/${mailId}/Body/html?target_origin=${encodeURIComponent('https://webmailer.mail.com')}&no_cache=${nc}`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://webmailer.mail.com',
+      },
+      body: `access_token=${s.accessToken}`,
+      proxy, fp,
+    });
+  };
 
-  let resp = await makeBodyReq(session.accessToken);
+  let resp = await makeBodyReq(session);
   if (resp.status === 401) {
     sessions.delete(email.toLowerCase());
     const fresh = await getSession(email, password, proxy);
-    resp = await makeBodyReq(fresh.accessToken);
+    resp = await makeBodyReq(fresh);
   }
   if (!resp.ok) throw new Error(`Mail body API failed: ${resp.status}`);
   return resp.text();
@@ -565,12 +594,28 @@ const OTP_FAST_MS = Number(process.env.OTP_FAST_MS) || 1000;
 const OTP_SLOW_MS = Number(process.env.OTP_SLOW_MS) || 2500;
 export async function waitForOTP(email, password, { proxy = null, maxMs = 300000, isNew = () => true, aborted = () => false } = {}) {
   const t0 = Date.now();
+  let lastErr = null;
+  let failStreak = 0;
   while (Date.now() - t0 < maxMs) {
     if (aborted()) return null;
-    const f = await findOTP(email, password, { proxy }).catch(() => null);
-    if (f?.code && isNew(f)) return f.code;
+    try {
+      const f = await findOTP(email, password, { proxy });
+      failStreak = 0;
+      lastErr = null;
+      if (f?.code && isNew(f)) return f.code;
+    } catch (error) {
+      lastErr = error;
+      failStreak += 1;
+      const msg = String(error?.message || error);
+      console.log(`[mail] #${email} otp fail: ${msg.slice(0, 220)}`);
+      if (/bad_password|sms_locked/i.test(msg)) throw error;
+      const blocked = /mail_blocked|mail_rate_limited|403 blocked/i.test(msg);
+      await sleep(blocked ? Math.min(12000, 1500 * failStreak) : (Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS));
+      continue;
+    }
     await sleep(Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS);
   }
+  if (lastErr) throw lastErr;
   return null;
 }
 
