@@ -149,7 +149,7 @@ function ownsJob(req, id) {
 function handleJobRoutes(kind, req, url, res, body) {
   const prefix = kind === 'check' ? '/api/checks' : '/api/jobs';
   const mgr = kind === 'check' ? checkManager : manager;
-  const match = url.pathname.match(new RegExp(`^${prefix}/([0-9a-f-]+)(?:/(cancel-renewal|subscription|cancel|retry))?$`, 'i'));
+  const match = url.pathname.match(new RegExp(`^${prefix}/([0-9a-f-]+)(?:/(cancel-renewal|subscription|cancel|retry|abort))?$`, 'i'));
   if (req.method === 'POST' && url.pathname === prefix) {
     // 代理池只认管理员配置；并发数按创建者的账号配额，普通用户传了也不算
     const user = auth.currentUser(req);
@@ -179,6 +179,15 @@ function handleJobRoutes(kind, req, url, res, body) {
   if (req.method === 'POST' && match[2] === 'cancel') {
     const job = mgr.cancel(match[1]);
     json(res, job ? 200 : 404, job || { error: '任务不存在或已清理' });
+    return true;
+  }
+  if (kind === 'session' && req.method === 'POST' && match[2] === 'abort') {
+    const result = mgr.abort(match[1], body || {});
+    if (!result.ok) {
+      json(res, result.status || 400, { error: result.error });
+      return true;
+    }
+    json(res, 202, result.job);
     return true;
   }
   if (req.method === 'POST' && match[2] === 'retry') {

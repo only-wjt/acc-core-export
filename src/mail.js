@@ -72,6 +72,14 @@ function isTokenExpired(session) {
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+async function sleepUnless(ms, aborted) {
+  const end = Date.now() + Math.max(0, ms);
+  while (Date.now() < end) {
+    if (typeof aborted === 'function' && aborted()) return true;
+    await sleep(Math.min(250, end - Date.now()));
+  }
+  return false;
+}
 // mail.com 每步登录超时:健康住宅代理 <3s 完成;12s 给足冗余,又比默认 30s 快失败 ~2.5x → 死代理不再静默挂满。env 可调。
 const LOGIN_STEP_TIMEOUT_MS = Number(process.env.MAIL_LOGIN_STEP_TIMEOUT_MS) || 12000;
 // 每步计时日志:一眼看出 mail 登录卡在哪一步、哪步最耗时。
@@ -600,6 +608,7 @@ export async function waitForOTP(email, password, { proxy = null, maxMs = 300000
     if (aborted()) return null;
     try {
       const f = await findOTP(email, password, { proxy });
+      if (aborted()) return null;
       failStreak = 0;
       lastErr = null;
       if (f?.code && isNew(f)) return f.code;
@@ -610,10 +619,10 @@ export async function waitForOTP(email, password, { proxy = null, maxMs = 300000
       console.log(`[mail] #${email} otp fail: ${msg.slice(0, 220)}`);
       if (/bad_password|sms_locked/i.test(msg)) throw error;
       const blocked = /mail_blocked|mail_rate_limited|403 blocked/i.test(msg);
-      await sleep(blocked ? Math.min(12000, 1500 * failStreak) : (Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS));
+      if (await sleepUnless(blocked ? Math.min(12000, 1500 * failStreak) : (Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS), aborted)) return null;
       continue;
     }
-    await sleep(Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS);
+    if (await sleepUnless(Date.now() - t0 < 15000 ? OTP_FAST_MS : OTP_SLOW_MS, aborted)) return null;
   }
   if (lastErr) throw lastErr;
   return null;

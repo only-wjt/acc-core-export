@@ -322,6 +322,12 @@ function renderJob(job) {
         : '';
       const retryDisabled = !item.canRetry || item.status === 'running' || item.status === 'pending';
       if (!item.canRetry) selectedAccountIndexes.delete(item.index);
+      let actionHtml = '—';
+      if (item.status === 'running') {
+        actionHtml = `<button class="retry-button abort-button" type="button" data-abort-index="${item.index}" ${item.aborting ? 'disabled' : ''}>${item.aborting ? '终止中' : '终止'}</button>`;
+      } else if (item.canRetry || item.status === 'failed') {
+        actionHtml = `<button class="retry-button" type="button" data-retry-index="${item.index}" ${retryDisabled ? 'disabled' : ''}>重试</button>`;
+      }
       return `
     <tr>
       <td class="select-col">${item.canRetry
@@ -332,9 +338,7 @@ function renderJob(job) {
       <td><span class="status-pill status-${item.status}">${statusLabels[item.status] || item.status}</span></td>
       <td>${formatDuration(item.durationMs)}</td>
       <td class="error-cell" title="${escapeHtml(item.error || '')}">${categoryTag}${escapeHtml(errorText)}</td>
-      <td class="action-cell">${item.canRetry || item.status === 'failed'
-        ? `<button class="retry-button" type="button" data-retry-index="${item.index}" ${retryDisabled ? 'disabled' : ''}>重试</button>`
-        : '—'}</td>
+      <td class="action-cell">${actionHtml}</td>
     </tr>`;
     }).join('')
     : `<tr class="empty-row"><td colspan="7">${statusFilter === 'failed' ? '当前没有失败或已取消的账号。' : '开始任务后，这里会逐项显示进度。'}</td></tr>`;
@@ -620,6 +624,25 @@ statusBody.addEventListener('change', (event) => {
 
 statusBody.addEventListener('click', async (event) => {
   if (event.target.closest('[data-account-select]')) return;
+  const abortButton = event.target.closest('[data-abort-index]');
+  if (abortButton && !abortButton.disabled) {
+    const index = Number(abortButton.dataset.abortIndex);
+    abortButton.disabled = true;
+    abortButton.textContent = '终止中';
+    try {
+      const job = await request(`/api/jobs/${currentJobId}/abort`, {
+        method: 'POST',
+        body: JSON.stringify({ index }),
+      });
+      renderJob(job);
+      ensurePolling();
+      showToast('已发送终止请求，结束后可重试');
+    } catch (error) {
+      showToast(error.message);
+      if (lastJob) renderJob(lastJob);
+    }
+    return;
+  }
   const button = event.target.closest('[data-retry-index]');
   if (!button || button.disabled) return;
   const index = Number(button.dataset.retryIndex);

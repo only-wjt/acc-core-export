@@ -130,6 +130,56 @@ test('cancel prevents pending work and discards running results', async () => {
   assert.deepEqual(job.sessions, []);
 });
 
+test('abort stops one running account without touching other successes', async () => {
+  let allowSlow = false;
+  const manager = createBatchManager({
+    waitForOTP: async (_email, _password, options) => {
+      for (let i = 0; i < 40; i++) {
+        if (options.aborted?.()) return null;
+        await wait(5);
+      }
+      return '123456';
+    },
+    getAccessToken: async (token) => ({ accessToken: `access-${token}`, sessionJson: JSON.stringify({ token }) }),
+    login: async (account, options) => {
+      if (account.email.startsWith('slow') && !allowSlow) {
+        await options.getOtp();
+        throw new Error('should have aborted');
+      }
+      return { sessionToken: `session-${account.email}` };
+    },
+  });
+
+  const created = manager.create({
+    concurrency: 2,
+    input: 'ok@example.com:mail1\nslow@example.com:mail2',
+  });
+  await wait(8);
+  const aborted = manager.abort(created.job.id, { index: 1 });
+  assert.equal(aborted.ok, true);
+  assert.equal(aborted.job.items[1].aborting, true);
+  assert.equal(aborted.job.items[1].canAbort, false);
+
+  const job = await waitForDone(manager, created.job.id);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.items[0].status, 'success');
+  assert.equal(job.items[1].status, 'cancelled');
+  assert.equal(job.items[1].canRetry, true);
+  assert.equal(job.sessions.length, 1);
+
+  const successAbort = manager.abort(created.job.id, { index: 0 });
+  assert.equal(successAbort.ok, false);
+  assert.equal(successAbort.status, 409);
+
+  allowSlow = true;
+  const retried = manager.retry(created.job.id, { index: 1 });
+  assert.equal(retried.ok, true);
+  const after = await waitForDone(manager, created.job.id);
+  assert.equal(after.items[1].status, 'success');
+  assert.equal(after.items[1].retryCount, 1);
+  assert.equal(after.sessions.length, 2);
+});
+
 test('retry reruns only the failed account, keeps proxy, and preserves other results', async () => {
   let failOnce = true;
   const proxiesUsed = [];

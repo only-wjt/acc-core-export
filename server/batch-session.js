@@ -225,6 +225,8 @@ function serializeItem(item) {
     errorCategory: item.errorCategory || '',
     retryCount: item.retryCount || 0,
     canRetry: isRetryable(item),
+    canAbort: item.status === 'running' && !item.abortRequested,
+    aborting: item.status === 'running' && Boolean(item.abortRequested),
     durationMs: item.startedAt ? (item.finishedAt || Date.now()) - item.startedAt : 0,
   };
 }
@@ -311,6 +313,7 @@ export function createBatchManager({
     item.billingStatus = 'idle';
     item.billingAction = '';
     item.billingError = '';
+    item.abortRequested = false;
     item.startedAt = null;
     item.finishedAt = null;
   }
@@ -322,10 +325,15 @@ export function createBatchManager({
     }
   }
 
+  function itemStopped(job, item) {
+    return job.cancelRequested || item.abortRequested;
+  }
+
   async function runItem(job, item) {
-    if (job.cancelRequested) {
+    if (itemStopped(job, item)) {
       item.status = 'cancelled';
       item.stage = '已取消';
+      item.abortRequested = false;
       item.finishedAt = now();
       return;
     }
@@ -342,55 +350,86 @@ export function createBatchManager({
           proxy: item.proxy,
           getOtp: async () => {
             item.stage = '等待邮箱验证码';
-            return waitForOTP(item.email, item.mailPassword, {
+            if (itemStopped(job, item)) {
+              const error = new Error('已终止');
+              error.aborted = true;
+              throw error;
+            }
+            const code = await waitForOTP(item.email, item.mailPassword, {
               proxy: item.proxy,
               maxMs: 180000,
-              aborted: () => job.cancelRequested,
+              aborted: () => itemStopped(job, item),
             });
+            if (itemStopped(job, item)) {
+              const error = new Error('已终止');
+              error.aborted = true;
+              throw error;
+            }
+            return code;
           },
           log: (message) => {
+            if (itemStopped(job, item)) return;
             const stage = mapStage(message);
             if (stage) item.stage = stage;
           },
         },
       );
 
-      if (job.cancelRequested) {
+      if (itemStopped(job, item)) {
         item.status = 'cancelled';
         item.stage = '已取消';
+        item.sessionToken = '';
+        item.sessionData = undefined;
       } else if (!result?.sessionToken) {
         throw new Error('登录成功但未返回 session');
       } else {
         item.stage = '获取完整 Session 数据';
         const sessionData = await getSessionData(result.sessionToken, item.proxy);
-        item.sessionToken = sessionData.sessionToken || result.sessionToken;
-        item.sessionData = sessionData;
-        item.accountId = result.accountId || sessionData.user?.accountId || null;
-        if (job.cancelRenewal && typeof cancelRenewal === 'function') {
-          item.stage = '取消自动续费';
-          try {
-            const cancelled = await cancelRenewal({
-              email: item.email,
-              sessionToken: item.sessionToken,
-              accessToken: sessionData.accessToken,
-              accountId: item.accountId,
-              sessionJson: sessionData.sessionJson,
-            }, item.proxy);
-            applyCancelResult(item, cancelled);
-          } catch (error) {
-            item.cancelRenewal = { ok: false, error: publicError(error) };
-            mergeCancelIntoSubscription(item);
+        if (itemStopped(job, item)) {
+          item.status = 'cancelled';
+          item.stage = '已取消';
+          item.sessionToken = '';
+          item.sessionData = undefined;
+        } else {
+          item.sessionToken = sessionData.sessionToken || result.sessionToken;
+          item.sessionData = sessionData;
+          item.accountId = result.accountId || sessionData.user?.accountId || null;
+          if (job.cancelRenewal && typeof cancelRenewal === 'function') {
+            item.stage = '取消自动续费';
+            try {
+              const cancelled = await cancelRenewal({
+                email: item.email,
+                sessionToken: item.sessionToken,
+                accessToken: sessionData.accessToken,
+                accountId: item.accountId,
+                sessionJson: sessionData.sessionJson,
+              }, item.proxy);
+              applyCancelResult(item, cancelled);
+            } catch (error) {
+              item.cancelRenewal = { ok: false, error: publicError(error) };
+              mergeCancelIntoSubscription(item);
+            }
+          }
+          if (itemStopped(job, item)) {
+            item.status = 'cancelled';
+            item.stage = '已取消';
+            item.sessionToken = '';
+            item.sessionData = undefined;
+          } else {
+            item.status = 'success';
+            item.stage = '完成';
           }
         }
-        item.status = 'success';
-        item.stage = '完成';
       }
     } catch (error) {
-      item.status = job.cancelRequested ? 'cancelled' : 'failed';
-      item.stage = job.cancelRequested ? '已取消' : '失败';
-      item.error = job.cancelRequested ? '' : publicError(error);
-      item.errorCategory = job.cancelRequested ? '' : classifyError(error);
+      const aborted = itemStopped(job, item) || error?.aborted;
+      item.status = aborted ? 'cancelled' : 'failed';
+      item.stage = aborted ? '已取消' : '失败';
+      item.error = aborted ? '' : publicError(error);
+      item.errorCategory = aborted ? '' : classifyError(error);
+      item.abortRequested = false;
     } finally {
+      item.abortRequested = false;
       // 成功后也保留凭据，便于 Session 过期后再次登录
       item.finishedAt = now();
     }
@@ -439,6 +478,7 @@ export function createBatchManager({
         stage: '等待开始',
         error: '',
         sessionToken: '',
+        abortRequested: false,
         startedAt: null,
         finishedAt: null,
       })),
@@ -467,6 +507,21 @@ export function createBatchManager({
       }
     }
     return serializeJob(job);
+  }
+
+  function abort(id, { index } = {}) {
+    cleanup();
+    const job = jobs.get(id);
+    if (!job) return { ok: false, status: 404, error: '任务不存在或已清理' };
+    if (!Number.isInteger(index) || index < 0) {
+      return { ok: false, status: 400, error: '请指定要终止的账号' };
+    }
+    const item = job.items.find((entry) => entry.index === index);
+    if (!item) return { ok: false, status: 404, error: '账号不存在' };
+    if (item.status !== 'running') return { ok: false, status: 409, error: '该账号当前不在处理中' };
+    item.abortRequested = true;
+    item.stage = '正在终止';
+    return { ok: true, job: serializeJob(job) };
   }
 
   function retry(id, { index, failed, indexes } = {}) {
@@ -625,5 +680,5 @@ export function createBatchManager({
     return { ok: true, job: serializeJob(job) };
   }
 
-  return { create, get, cancel, retry, querySubscription, cancelRenewalNow, cleanup };
+  return { create, get, cancel, abort, retry, querySubscription, cancelRenewalNow, cleanup };
 }

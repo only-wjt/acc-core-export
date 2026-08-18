@@ -789,6 +789,8 @@ table input[type="checkbox"] {
   transition: color var(--ease), background-color var(--ease), border-color var(--ease);
 }
 .retry-button:hover:not(:disabled) { background: var(--brass-tint); border-color: var(--brass); }
+.abort-button { color: var(--stop); border-color: color-mix(in srgb, var(--stop) 38%, transparent); }
+.abort-button:hover:not(:disabled) { color: var(--stop); background: var(--stop-soft); border-color: var(--stop); }
 
 button[data-delete-user] { color: var(--stop); border-color: color-mix(in srgb, var(--stop) 38%, transparent); }
 button[data-delete-user]:hover:not(:disabled) { color: var(--stop); background: var(--stop-soft); border-color: var(--stop); }
