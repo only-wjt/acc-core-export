@@ -219,7 +219,7 @@ function proxyKey(p) {
 
 // 登录限流:login.mail.com 对高并发自动化登录敏感(会在 halogin 步静默拒绝/转人工验证),
 // 限制同时只有 LOGIN_CONCURRENCY 个登录在飞行,且两次登录启动间隔不少于 LOGIN_MIN_GAP_MS。
-// 并发/间隔来自中央配置(默认 15 并发、0 间隔)。每号独立 IP+指纹 → 不再一刀切 2。
+// 工作台默认 2 并发、1.5s 间隔，避免共享代理池时把 mail.com 打进协助页。
 const LOGIN_CONCURRENCY = MAIL_LOGIN_CONCURRENCY;
 const LOGIN_MIN_GAP_MS = MAIL_LOGIN_GAP_MS;
 let _loginActive = 0;
@@ -507,32 +507,42 @@ export async function listMail(email, password, { page = 0, size = 50, folder = 
 }
 
 export async function getBody(email, password, mailId, proxy) {
-  const session = await getSession(email, password, proxy);
   const fp = pickFingerprint(email);
-
-  const makeBodyReq = (s) => {
-    const nc = s.authId || '';
-    return chromeFetch(
-      `https://mailcom.mailbody-ui.de/Mail/${mailId}/Body/html?target_origin=${encodeURIComponent('https://webmailer.mail.com')}&no_cache=${nc}`, {
-      method: 'POST',
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Origin': 'https://webmailer.mail.com',
-      },
-      body: `access_token=${s.accessToken}`,
-      proxy, fp,
-    });
-  };
-
-  let resp = await makeBodyReq(session);
-  if (resp.status === 401) {
-    sessions.delete(email.toLowerCase());
-    const fresh = await getSession(email, password, proxy);
-    resp = await makeBodyReq(fresh);
+  const attempts = proxy ? [proxy, null] : [null];
+  let lastErr = null;
+  for (const p of attempts) {
+    for (let i = 0; i < 3; i++) {
+      try {
+        const session = await getSession(email, password, p);
+        const makeBodyReq = (s) => {
+          const nc = s.authId || '';
+          return chromeFetch(
+            `https://mailcom.mailbody-ui.de/Mail/${mailId}/Body/html?target_origin=${encodeURIComponent('https://webmailer.mail.com')}&no_cache=${nc}`, {
+            method: 'POST',
+            headers: {
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Origin': 'https://webmailer.mail.com',
+            },
+            body: `access_token=${s.accessToken}`,
+            proxy: p, fp,
+          });
+        };
+        let resp = await makeBodyReq(session);
+        if (resp.status === 401) {
+          sessions.delete(email.toLowerCase());
+          const fresh = await getSession(email, password, p);
+          resp = await makeBodyReq(fresh);
+        }
+        if (!resp.ok) throw new Error(`Mail body API failed: ${resp.status}`);
+        return resp.text();
+      } catch (e) {
+        lastErr = e;
+        await sleep(400 * (i + 1));
+      }
+    }
   }
-  if (!resp.ok) throw new Error(`Mail body API failed: ${resp.status}`);
-  return resp.text();
+  throw lastErr || new Error('Mail body API failed');
 }
 
 export async function findOTP(email, password, { maxAge = 10 * 60 * 1000, pattern, proxy } = {}) {

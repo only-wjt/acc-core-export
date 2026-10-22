@@ -698,6 +698,7 @@ select { cursor: pointer; }
 .reason-risk { color: var(--risk); background: var(--risk-soft); }
 .reason-proxy { color: var(--info); background: var(--info-soft); }
 .reason-session { color: var(--go); background: var(--go-soft); }
+.reason-ineligible { color: var(--stop); background: var(--stop-soft); }
 .reason-unknown { color: var(--muted); background: var(--raised); }
 
 .table-toolbar {

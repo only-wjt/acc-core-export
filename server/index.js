@@ -8,11 +8,13 @@ import { getSubscriptionInfo, cancelRenewal } from '../src/gpt-subscription.js';
 import { shutdownCycleTLS } from '../src/ctls.js';
 import { createBatchManager } from './batch-session.js';
 import { createCheckManager } from './batch-check.js';
+import { createPasswordManager } from './batch-password.js';
 import { createAuth } from './auth.js';
 import { createStore } from './persist.js';
 import { createAdminSettings } from './admin-settings.js';
 import { createApiKeys } from './api-keys.js';
 import { createOpenApi } from './openapi.js';
+import { authorizeCodexAccount } from '../src/codex-oauth.js';
 import { getOpenApiDocs } from './openapi-spec.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
@@ -45,14 +47,21 @@ const checkManager = createCheckManager({
   checkAlive: gpt.checkAlive,
   onFinish: (job) => store.saveJob('check', job, { owner: jobOwners.get(job.id) || 'local' }),
 });
+const passwordManager = createPasswordManager({
+  addPassword: gpt.addPassword,
+  waitForOTP: mail.waitForOTP,
+  onFinish: (job) => store.saveJob('password', job, { owner: jobOwners.get(job.id) || 'local' }),
+});
 const openApi = createOpenApi({
   apiKeys,
   manager,
   checkManager,
+  passwordManager,
   jobOwners,
   adminSettings,
   gpt,
   mail,
+  authorizeCodex: authorizeCodexAccount,
 });
 
 const contentTypes = {
@@ -146,21 +155,32 @@ function ownsJob(req, id) {
   return jobOwners.get(id) === user.username;
 }
 
+function resolveJobConcurrency(req, body) {
+  const user = auth.currentUser(req);
+  const quota = auth.concurrencyFor(user?.username);
+  const requested = Number(body?.concurrency);
+  const canOverride = user?.role === 'admin' && Number.isInteger(requested) && requested > 0;
+  return Math.max(1, Math.min(auth.concurrencyLimit, canOverride ? requested : quota));
+}
+
 function handleJobRoutes(kind, req, url, res, body) {
-  const prefix = kind === 'check' ? '/api/checks' : '/api/jobs';
-  const mgr = kind === 'check' ? checkManager : manager;
+  const routes = {
+    session: { prefix: '/api/jobs', mgr: manager, abort: true },
+    check: { prefix: '/api/checks', mgr: checkManager, abort: false },
+    password: { prefix: '/api/passwords', mgr: passwordManager, abort: true },
+  };
+  const route = routes[kind];
+  if (!route) return false;
+  const { prefix, mgr } = route;
+  const user = auth.currentUser(req);
   const match = url.pathname.match(new RegExp(`^${prefix}/([0-9a-f-]+)(?:/(cancel-renewal|subscription|cancel|retry|abort))?$`, 'i'));
   if (req.method === 'POST' && url.pathname === prefix) {
     // 代理池只认管理员配置；并发数按创建者的账号配额，普通用户传了也不算
-    const user = auth.currentUser(req);
-    const quota = auth.concurrencyFor(user?.username);
-    const requested = Number(body?.concurrency);
-    const canOverride = user?.role === 'admin' && Number.isInteger(requested) && requested > 0;
     const settings = adminSettings.get();
     const result = mgr.create({
       ...(body || {}),
       proxies: settings.proxyText,
-      concurrency: Math.max(1, Math.min(auth.concurrencyLimit, canOverride ? requested : quota)),
+      concurrency: resolveJobConcurrency(req, body),
     });
     if (result.ok) jobOwners.set(result.job.id, user?.username || 'local');
     json(res, result.ok ? 202 : 400, result.ok ? result.job : { errors: result.errors });
@@ -181,7 +201,7 @@ function handleJobRoutes(kind, req, url, res, body) {
     json(res, job ? 200 : 404, job || { error: '任务不存在或已清理' });
     return true;
   }
-  if (kind === 'session' && req.method === 'POST' && match[2] === 'abort') {
+  if (route.abort && req.method === 'POST' && match[2] === 'abort') {
     const result = mgr.abort(match[1], body || {});
     if (!result.ok) {
       json(res, result.status || 400, { error: result.error });
@@ -191,7 +211,13 @@ function handleJobRoutes(kind, req, url, res, body) {
     return true;
   }
   if (req.method === 'POST' && match[2] === 'retry') {
-    const result = mgr.retry(match[1], body || {});
+    const patch = { ...(body || {}) };
+    if (Number.isInteger(Number(body?.concurrency)) && Number(body.concurrency) > 0) {
+      patch.concurrency = resolveJobConcurrency(req, body);
+    } else {
+      delete patch.concurrency;
+    }
+    const result = mgr.retry(match[1], patch);
     if (!result.ok) {
       json(res, result.status || 400, { error: result.error });
       return true;
@@ -297,7 +323,7 @@ const server = http.createServer(async (req, res) => {
       const result = await store.search({
         owner: user?.username,
         isAdmin: user?.role === 'admin',
-        kind: ['session', 'check'].includes(kind) ? kind : '',
+        kind: ['session', 'check', 'password'].includes(kind) ? kind : '',
         q: url.searchParams.get('q') || '',
         page: Number(url.searchParams.get('page')) || 1,
         pageSize: Number(url.searchParams.get('pageSize')) || 20,
@@ -444,6 +470,7 @@ const server = http.createServer(async (req, res) => {
 
     if (handleJobRoutes('session', req, url, res, body)) return;
     if (handleJobRoutes('check', req, url, res, body)) return;
+    if (handleJobRoutes('password', req, url, res, body)) return;
 
     if (req.method === 'POST' && url.pathname === '/api/totp') {
       try {
@@ -517,16 +544,46 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/password/gpt') {
+      const getOtp = body.mailPassword
+        ? () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 })
+        : undefined;
       const result = await gpt.changePassword(
         { email: body.email, gptPassword: body.gptPassword, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
         {
           currentPassword: body.gptPassword,
           newPassword: body.newPassword,
           totpSecret: body.totpSecret || null,
+          getOtp,
           proxy: body.proxy || null,
         },
       );
       json(res, 200, { ok: Boolean(result?.ok), message: 'GPT 密码已修改' });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/password/gpt-add') {
+      if (!body.email || !body.mailPassword) {
+        json(res, 400, { error: '请填写邮箱和邮箱密码' });
+        return;
+      }
+      const newPassword = body.newPassword
+        ? gpt.assertGptPassword(body.newPassword)
+        : gpt.generateGptPassword();
+      const result = await gpt.addPassword(
+        { email: body.email, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
+        {
+          newPassword,
+          totpSecret: body.totpSecret || null,
+          getOtp: () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 }),
+          proxy: body.proxy || null,
+        },
+      );
+      json(res, 200, {
+        ok: Boolean(result?.ok),
+        newPassword: result.newPassword || newPassword,
+        line: `${body.email}----${result.newPassword || newPassword}----${body.mailPassword}`,
+        message: '已添加 GPT 密码',
+      });
       return;
     }
 

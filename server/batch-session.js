@@ -18,16 +18,29 @@ function classifyError(error) {
   const text = String(error?.message || error || '');
   if (/(密码错误|密码不正确|wrong password|invalid[\s_-]*(login|password|credential)|凭据无效)/i.test(text)) return 'password';
   if (/(验证码|OTP|未取到.*码|邮件验证)/i.test(text)) return 'otp';
-  if (/(429|rate[\s_-]*limit|too many|风控|频率|blocked|封禁|challenge|cloudflare|人机验证|访问被拒)/i.test(text)) return 'risk';
+  if (/(429|rate[\s_-]*limit|too many|风控|频率|blocked|封禁|challenge|cloudflare|人机验证|访问被拒|mail_sms_locked|sms_locked|协助)/i.test(text)) return 'risk';
   if (/(代理|proxy|socks|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|tunnel|socket hang up|network|fetch failed|getaddrinfo|连接超时|无法连接)/i.test(text)) return 'proxy';
   if (/取消续费|will_renew/i.test(text)) return 'billing';
   if (/session/i.test(text)) return 'session';
   return 'unknown';
 }
 
-function pickProxy(proxies) {
+function isRotatableMailError(error) {
+  return /(mail_sms_locked|sms_locked|mail_blocked|出口IP被拒|mail_rate_limited)/i.test(String(error?.message || error || ''));
+}
+
+function pickProxy(proxies, { avoid, state } = {}) {
   if (!proxies || !proxies.length) return null;
-  return proxies[Math.floor(Math.random() * proxies.length)];
+  const pool = avoid && proxies.length > 1
+    ? proxies.filter((item) => item !== avoid)
+    : proxies;
+  if (state) {
+    state.cursor = Number(state.cursor) || 0;
+    const proxy = pool[state.cursor % pool.length];
+    state.cursor += 1;
+    return proxy;
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 export function parseAccounts(input, { maxAccounts = DEFAULT_MAX_ACCOUNTS } = {}) {
@@ -305,7 +318,7 @@ export function createBatchManager({
     item.stage = '等待重试';
     item.error = '';
     item.errorCategory = '';
-    item.proxy = pickProxy(proxies);
+    item.proxy = pickProxy(proxies, { avoid: item.proxy });
     item.sessionToken = '';
     item.sessionData = undefined;
     item.subscriptionInfo = null;
@@ -342,38 +355,50 @@ export function createBatchManager({
     item.stage = '连接 ChatGPT';
     item.startedAt = now();
 
-    try {
-      const result = await login(
-        { email: item.email, gptPassword: item.gptPassword },
-        {
-          password: item.gptPassword,
-          proxy: item.proxy,
-          getOtp: async () => {
-            item.stage = '等待邮箱验证码';
-            if (itemStopped(job, item)) {
-              const error = new Error('已终止');
-              error.aborted = true;
-              throw error;
-            }
-            const code = await waitForOTP(item.email, item.mailPassword, {
-              proxy: item.proxy,
-              maxMs: 180000,
-              aborted: () => itemStopped(job, item),
-            });
-            if (itemStopped(job, item)) {
-              const error = new Error('已终止');
-              error.aborted = true;
-              throw error;
-            }
-            return code;
-          },
-          log: (message) => {
-            if (itemStopped(job, item)) return;
-            const stage = mapStage(message);
-            if (stage) item.stage = stage;
-          },
+    const runLogin = () => login(
+      { email: item.email, gptPassword: item.gptPassword },
+      {
+        password: item.gptPassword,
+        proxy: item.proxy,
+        getOtp: async () => {
+          item.stage = '等待邮箱验证码';
+          if (itemStopped(job, item)) {
+            const error = new Error('已终止');
+            error.aborted = true;
+            throw error;
+          }
+          const code = await waitForOTP(item.email, item.mailPassword, {
+            proxy: item.proxy,
+            maxMs: 180000,
+            aborted: () => itemStopped(job, item),
+          });
+          if (itemStopped(job, item)) {
+            const error = new Error('已终止');
+            error.aborted = true;
+            throw error;
+          }
+          return code;
         },
-      );
+        log: (message) => {
+          if (itemStopped(job, item)) return;
+          const stage = mapStage(message);
+          if (stage) item.stage = stage;
+        },
+      },
+    );
+
+    try {
+      let result;
+      try {
+        result = await runLogin();
+      } catch (error) {
+        if (itemStopped(job, item) || !isRotatableMailError(error) || (job.proxies || []).length < 2) throw error;
+        const switched = pickProxy(job.proxies, { avoid: item.proxy, state: job.proxyState });
+        if (!switched || switched === item.proxy) throw error;
+        item.proxy = switched;
+        item.stage = '更换代理后重试登录';
+        result = await runLogin();
+      }
 
       if (itemStopped(job, item)) {
         item.status = 'cancelled';
@@ -435,12 +460,39 @@ export function createBatchManager({
     }
   }
 
+  function pumpRunSlots(job) {
+    job.runWaiters = job.runWaiters || [];
+    job.activeRunners = job.activeRunners || 0;
+    while (job.activeRunners < job.concurrency && job.runWaiters.length) {
+      job.activeRunners += 1;
+      job.runWaiters.shift()();
+    }
+  }
+
+  function acquireRunSlot(job) {
+    return new Promise((resolve) => {
+      job.runWaiters = job.runWaiters || [];
+      job.runWaiters.push(resolve);
+      pumpRunSlots(job);
+    });
+  }
+
+  function releaseRunSlot(job) {
+    job.activeRunners = Math.max(0, (job.activeRunners || 1) - 1);
+    pumpRunSlots(job);
+  }
+
   async function runItems(job, items) {
     let cursor = 0;
     const workers = Array.from({ length: Math.min(job.concurrency, items.length) }, async () => {
       while (cursor < items.length) {
         const item = items[cursor++];
-        await runItem(job, item);
+        await acquireRunSlot(job);
+        try {
+          await runItem(job, item);
+        } finally {
+          releaseRunSlot(job);
+        }
       }
     });
     await Promise.all(workers);
@@ -459,6 +511,7 @@ export function createBatchManager({
     if (errors.length) return { ok: false, errors };
 
     const normalizedConcurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number(concurrency) || 2));
+    const proxyState = { cursor: 0 };
     const job = {
       id: randomUUID(),
       status: 'running',
@@ -468,12 +521,13 @@ export function createBatchManager({
       concurrency: normalizedConcurrency,
       cancelRenewal: cancelRenewalEnabled === true,
       proxies: parsedProxies.proxies,
+      proxyState,
       items: parsed.accounts.map((account) => ({
         ...account,
         accountDisplay: account.gptPassword
           ? `${account.email}----${account.gptPassword}----${account.mailPassword}`
           : `${account.email}:${account.mailPassword}`,
-        proxy: pickProxy(parsedProxies.proxies),
+        proxy: pickProxy(parsedProxies.proxies, { state: proxyState }),
         status: 'pending',
         stage: '等待开始',
         error: '',
@@ -524,7 +578,7 @@ export function createBatchManager({
     return { ok: true, job: serializeJob(job) };
   }
 
-  function retry(id, { index, failed, indexes } = {}) {
+  function retry(id, { index, failed, indexes, concurrency } = {}) {
     cleanup();
     const job = jobs.get(id);
     if (!job) return { ok: false, status: 404, error: '任务不存在或已清理' };
@@ -560,6 +614,10 @@ export function createBatchManager({
     if (job.finishedAt) job.cancelRequested = false;
     job.status = 'running';
     job.finishedAt = null;
+    const requestedConcurrency = Number(concurrency);
+    if (Number.isInteger(requestedConcurrency) && requestedConcurrency > 0) {
+      job.concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, requestedConcurrency));
+    }
     for (const item of targets) resetItemForRetry(item, job.proxies);
     void runItems(job, targets);
     return { ok: true, job: serializeJob(job) };

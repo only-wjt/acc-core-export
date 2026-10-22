@@ -14,6 +14,7 @@
  *   node examples/demo.mjs gpt-enable   '{"email":"x","gptPassword":"pw","sessionToken":"eyJ..."}'
  *   node examples/demo.mjs gpt-disable  '{"email":"x","gptPassword":"pw","totpSecret":"BASE32","sessionToken":"eyJ..."}'
  *   node examples/demo.mjs gpt-chgpw    '{"email":"x","gptPassword":"old","totpSecret":"BASE32","newPassword":"new"}'
+ *   node examples/demo.mjs gpt-addpw    '{"email":"x@mail.com","mailPassword":"mail","newPassword":"new"}'
  *   node examples/demo.mjs totp         '{"totpSecret":"BASE32"}'
  *
  * 可选：设置代理  PROXY='http://user:pass@host:port'（各能力都会透传）。
@@ -116,9 +117,32 @@ async function main() {
       // 改 GPT 密码
       const r = await gpt.changePassword(
         { email: arg.email, gptPassword: arg.gptPassword, totpSecret: arg.totpSecret },
-        { currentPassword: arg.gptPassword, newPassword: arg.newPassword, totpSecret: arg.totpSecret, proxy, log }
+        {
+          currentPassword: arg.gptPassword,
+          newPassword: arg.newPassword,
+          totpSecret: arg.totpSecret,
+          getOtp: arg.mailPassword
+            ? async () => mail.waitForOTP(arg.email, arg.mailPassword, { proxy, maxMs: 180000 })
+            : undefined,
+          proxy,
+          log,
+        }
       );
       log('changePassword:', r);
+      break;
+    }
+    case 'gpt-addpw': {
+      const r = await gpt.addPassword(
+        { email: arg.email, totpSecret: arg.totpSecret },
+        {
+          newPassword: arg.newPassword,
+          getOtp: async () => mail.waitForOTP(arg.email, arg.mailPassword, { proxy, maxMs: 180000 }),
+          totpSecret: arg.totpSecret,
+          proxy,
+          log,
+        }
+      );
+      log('addPassword:', r);
       break;
     }
     case 'totp': {

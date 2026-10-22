@@ -23,7 +23,7 @@ export function createStore({ dir = process.env.PERSIST_DIR || '', now = () => D
       createdAt: job.createdAt,
       finishedAt: job.finishedAt,
       counts: job.counts,
-      sessions: job.sessions || [],
+      sessions: kind === 'password' ? [] : (job.sessions || []),
       items: (job.items || []).map((item) => ({
         email: item.email,
         status: item.status,
@@ -40,7 +40,7 @@ export function createStore({ dir = process.env.PERSIST_DIR || '', now = () => D
     if (!enabled) return [];
     await ensure();
     const names = (await readdir(root).catch(() => []))
-      .filter((name) => /^(session|check)-.*\.json$/.test(name))
+      .filter((name) => /^(session|check|password)-.*\.json$/.test(name))
       .sort()
       .reverse();
     const rows = [];
@@ -74,7 +74,7 @@ export function createStore({ dir = process.env.PERSIST_DIR || '', now = () => D
     if (!enabled) return { items: [], total: 0, page: 1, pageSize: size, owners: [] };
     await ensure();
     const names = (await readdir(root).catch(() => []))
-      .filter((name) => /^(session|check)-.*\.json$/.test(name))
+      .filter((name) => /^(session|check|password)-.*\.json$/.test(name))
       .sort()
       .reverse();
 
@@ -121,7 +121,7 @@ export function createStore({ dir = process.env.PERSIST_DIR || '', now = () => D
 
   async function readJob(file, { owner, isAdmin = false } = {}) {
     if (!enabled) return null;
-    if (!/^(session|check)-[\w.-]+\.json$/.test(String(file || ''))) return null;
+    if (!/^(session|check|password)-[\w.-]+\.json$/.test(String(file || ''))) return null;
     try {
       const data = JSON.parse(await readFile(resolve(root, file), 'utf8'));
       if (!isAdmin && owner && data.owner && data.owner !== owner) return null;

@@ -21,6 +21,25 @@ test('parseSessionInputs accepts email----token and bare tokens', () => {
   assert.equal(result.accounts[1].email, '');
 });
 
+test('parseSessionInputs extracts sessionToken from session JSON', () => {
+  const token = 'eyJcccccccccccccccccccc';
+  const blob = JSON.stringify({
+    accessToken: 'eyJaccess',
+    sessionToken: token,
+    user: { email: 'json@example.com' },
+    highlighted_account: { fetched: false },
+  });
+  const one = parseSessionInputs(blob);
+  assert.equal(one.errors.length, 0);
+  assert.equal(one.accounts.length, 1);
+  assert.equal(one.accounts[0].sessionToken, token);
+  assert.equal(one.accounts[0].email, 'json@example.com');
+
+  const lined = parseSessionInputs(`b@example.com----${blob}`);
+  assert.equal(lined.accounts[0].sessionToken, token);
+  assert.equal(lined.accounts[0].email, 'b@example.com');
+});
+
 test('check manager reports alive and dead rows without leaking tokens', async () => {
   const manager = createCheckManager({
     checkAlive: async (account) => {

@@ -12,9 +12,30 @@ function publicError(error) {
     .slice(0, 300);
 }
 
-// 验活输入：每行 `邮箱----sessionToken` 或直接一个 sessionToken（邮箱用于稳定指纹，可省略）。
+function extractSessionValue(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return { email: '', sessionToken: '' };
+  if (text.startsWith('{')) {
+    try {
+      const json = JSON.parse(text);
+      return {
+        email: String(json.email || json.user?.email || json.user?.emailAddress || '').trim(),
+        sessionToken: String(json.sessionToken || json.session_token || json.session || '').trim(),
+      };
+    } catch {
+      return { email: '', sessionToken: '' };
+    }
+  }
+  return { email: '', sessionToken: text };
+}
+
+// 验活输入：每行 `邮箱----sessionToken`、单独 token，或取 Session 复制出来的整段 JSON。
 export function parseSessionInputs(input, { maxAccounts = DEFAULT_MAX_ACCOUNTS } = {}) {
-  const lines = String(input || '').split(/\r?\n/);
+  const text = String(input || '').trim();
+  const asOne = extractSessionValue(text);
+  const lines = asOne.sessionToken && text.startsWith('{')
+    ? [text]
+    : String(input || '').split(/\r?\n/);
   const accounts = [];
   const errors = [];
   const seen = new Set();
@@ -27,12 +48,17 @@ export function parseSessionInputs(input, { maxAccounts = DEFAULT_MAX_ACCOUNTS }
     let sessionToken = raw;
     if (raw.includes('----')) {
       const parts = raw.split('----').map((part) => part.trim());
-      sessionToken = parts[parts.length - 1];
-      email = parts[0];
+      const tail = extractSessionValue(parts.slice(1).join('----'));
+      sessionToken = tail.sessionToken || parts[parts.length - 1];
+      email = /^\S+@\S+\.\S+$/.test(parts[0]) ? parts[0] : (tail.email || '');
+    } else {
+      const parsed = extractSessionValue(raw);
+      sessionToken = parsed.sessionToken;
+      email = parsed.email;
     }
 
-    if (!sessionToken || sessionToken.length < 20) {
-      errors.push({ line: index + 1, message: 'sessionToken 无效（每行应为 邮箱----token 或单独 token）' });
+    if (!sessionToken || sessionToken.length < 20 || sessionToken.startsWith('{')) {
+      errors.push({ line: index + 1, message: 'sessionToken 无效（每行应为 邮箱----token、单独 token，或 session JSON）' });
       continue;
     }
     const key = sessionToken.slice(0, 64);
@@ -150,10 +176,40 @@ export function createCheckManager({
   async function runItems(job, items) {
     let cursor = 0;
     const workers = Array.from({ length: Math.min(job.concurrency, items.length) }, async () => {
-      while (cursor < items.length) await runItem(job, items[cursor++]);
+      while (cursor < items.length) {
+        const item = items[cursor++];
+        await acquireRunSlot(job);
+        try {
+          await runItem(job, item);
+        } finally {
+          releaseRunSlot(job);
+        }
+      }
     });
     await Promise.all(workers);
     maybeFinishJob(job);
+  }
+
+  function pumpRunSlots(job) {
+    job.runWaiters = job.runWaiters || [];
+    job.activeRunners = job.activeRunners || 0;
+    while (job.activeRunners < job.concurrency && job.runWaiters.length) {
+      job.activeRunners += 1;
+      job.runWaiters.shift()();
+    }
+  }
+
+  function acquireRunSlot(job) {
+    return new Promise((resolve) => {
+      job.runWaiters = job.runWaiters || [];
+      job.runWaiters.push(resolve);
+      pumpRunSlots(job);
+    });
+  }
+
+  function releaseRunSlot(job) {
+    job.activeRunners = Math.max(0, (job.activeRunners || 1) - 1);
+    pumpRunSlots(job);
   }
 
   function create({ input, proxies = '', concurrency = 5 } = {}) {
@@ -208,7 +264,7 @@ export function createCheckManager({
     return serializeJob(job);
   }
 
-  function retry(id, { index, failed, indexes } = {}) {
+  function retry(id, { index, failed, indexes, concurrency } = {}) {
     cleanup();
     const job = jobs.get(id);
     if (!job) return { ok: false, status: 404, error: '任务不存在或已清理' };
@@ -241,6 +297,10 @@ export function createCheckManager({
     if (job.finishedAt) job.cancelRequested = false;
     job.status = 'running';
     job.finishedAt = null;
+    const requestedConcurrency = Number(concurrency);
+    if (Number.isInteger(requestedConcurrency) && requestedConcurrency > 0) {
+      job.concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, requestedConcurrency));
+    }
     for (const item of targets) {
       item.retryCount = (item.retryCount || 0) + 1;
       item.status = 'pending';

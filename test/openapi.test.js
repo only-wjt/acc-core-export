@@ -136,3 +136,35 @@ test('docs are public and rate limit returns 429', async () => {
   await openApi.handle({ method: 'GET', headers }, second, url('/openapi/v1/me'), {});
   assert.equal(second.status, 429);
 });
+
+test('codex authorize forwards proxy and does not echo the mailbox password', async () => {
+  const apiKeys = createApiKeys({ file: await tempFile(), envKey: '' });
+  const created = apiKeys.create({ name: 'login', actor: { username: 'alice', role: 'admin', concurrency: 1 } });
+  let seen = null;
+  const openApi = createOpenApi({
+    apiKeys,
+    manager: { create() { throw new Error('unused'); }, get() { return null; }, cancel() { return null; } },
+    checkManager: { create() { throw new Error('unused'); }, get() { return null; }, cancel() { return null; } },
+    jobOwners: new Map(),
+    adminSettings: { get() { return { proxyText: '' }; } },
+    gpt: {},
+    mail: {},
+    authorizeCodex: async (opts) => {
+      seen = opts;
+      return { accountId: 10, schedulable: false, skippedTest: true, accessToken: 'at', refreshToken: 'rt' };
+    },
+  });
+  const res = mockRes();
+  await openApi.handle(
+    { method: 'POST', headers: { authorization: `Bearer ${created.key}` } },
+    res,
+    url('/openapi/v1/codex/authorize'),
+    { email: 'a@mail.com', mailPassword: 'secret-mail', proxyUrl: 'socks5://127.0.0.1:1080', skipTest: true, concurrency: 3 },
+  );
+  assert.equal(res.status, 200);
+  assert.equal(res.body.accountId, 10);
+  assert.equal(res.body.skippedTest, true);
+  assert.equal(seen.proxy, 'socks5://127.0.0.1:1080');
+  assert.equal(seen.skipTest, true);
+  assert.equal(JSON.stringify(res.body).includes('secret-mail'), false);
+});

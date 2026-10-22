@@ -44,3 +44,23 @@ test('regular users only list their own jobs', async () => {
   assert.deepEqual(alice.map((item) => item.owner), ['alice']);
   assert.equal(admin.length, 2);
 });
+
+test('saves a password job without result lines', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'acc-persist-'));
+  const store = createStore({ dir, now: () => Date.parse('2026-09-07T00:00:00Z') });
+  const file = await store.saveJob('password', {
+    id: 'cccccccc-3333-3333-3333-333333333333',
+    status: 'completed',
+    createdAt: Date.parse('2026-09-07T00:00:00Z'),
+    finishedAt: Date.parse('2026-09-07T00:01:00Z'),
+    counts: { total: 1, success: 1 },
+    results: ['a@example.com----newpw----mailpw'],
+    items: [{ email: 'a@example.com', status: 'success', resultLine: 'a@example.com----newpw----mailpw' }],
+  });
+  assert.ok(file);
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(saved.kind, 'password');
+  assert.doesNotMatch(JSON.stringify(saved), /newpw|mailpw/);
+  const recent = await store.listRecent();
+  assert.equal(recent[0].kind, 'password');
+});

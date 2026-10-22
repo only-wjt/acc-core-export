@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>ACC 工作台</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 42 42'><rect width='42' height='42' rx='12' fill='%23c9a36a' fill-opacity='0.12'/><rect width='42' height='42' rx='12' fill='none' stroke='%23c9a36a' stroke-width='1'/><circle cx='21' cy='15' r='5' fill='none' stroke='%23c9a36a' stroke-width='1.6'/><rect x='19.5' y='21' width='3' height='10' rx='1' fill='%23c9a36a'/></svg>">
-  <link rel="stylesheet" href="/styles.css?v=11">
+  <link rel="stylesheet" href="/styles.css?v=16">
   <script src="/theme.js?v=2"></script>
 </head>
 <body>
@@ -37,7 +37,7 @@
     <nav class="app-tabs" role="tablist" aria-label="功能">
       <button class="app-tab is-active" type="button" data-panel="session">取 Session</button>
       <button class="app-tab" type="button" data-panel="check">验活</button>
-      <button class="app-tab" type="button" data-panel="password">改密</button>
+      <button class="app-tab" type="button" data-panel="password">改密 / 添加密码</button>
       <button class="app-tab" type="button" data-panel="mfa">2FA</button>
       <button class="app-tab" type="button" data-panel="history">历史</button>
       <button class="app-tab" type="button" data-panel="openapi">开放 API</button>
@@ -177,7 +177,7 @@
           <button class="icon-text-button" id="importCheck" type="button">导入 Token 文件</button>
           <input id="checkFile" type="file" accept=".txt,.csv,.log" hidden>
         </div>
-        <textarea id="checkInput" rows="8" spellcheck="false" autocomplete="off" placeholder="每行一条：&#10;邮箱----sessionToken&#10;或直接粘贴 sessionToken"></textarea>
+          <textarea id="checkInput" rows="8" spellcheck="false" autocomplete="off" placeholder="每行一条：&#10;邮箱----sessionToken&#10;或直接粘贴 sessionToken / 取 Session 的整段 JSON"></textarea>
         <div class="runtime-row" data-admin-only="true" hidden>
           <label class="compact-field concurrency-field">
             <span>并发数 <small>管理员可临时调整</small></span>
@@ -284,26 +284,117 @@
     </div>
 
     <div class="app-panel" id="panel-password" data-panel="password" hidden>
+      <section class="control-band" aria-labelledby="pw-batch-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">无密码号</p>
+            <h2 id="pw-batch-title">批量添加 GPT 密码</h2>
+          </div>
+          <div class="parse-count" id="pwParseCount">0 条有效输入</div>
+        </div>
+        <p class="action-note block-note">无密码号先走官方忘记密码授权，拿不到再登录后走 Settings 添加。不要用「改已有密码」。成功后按 <code>邮箱----GPT密码----邮箱密码</code> 输出。</p>
+        <label class="field-label" for="pwAccounts">账号数据</label>
+        <div class="import-row">
+          <button class="icon-text-button" id="importPwAccounts" type="button">导入账号文件</button>
+          <input id="pwAccountsFile" type="file" accept=".txt,.csv,.log" hidden>
+        </div>
+        <div class="secret-editor">
+          <textarea id="pwAccounts" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="每行一个：&#10;邮箱:邮箱密码&#10;或&#10;邮箱----邮箱密码&#10;可选再加 ----session（添加密码用不到）"></textarea>
+          <button class="icon-button" id="togglePwSecrets" type="button" title="显示输入内容" aria-label="显示输入内容">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+          </button>
+        </div>
+        <div class="input-errors" id="pwInputErrors" role="alert"></div>
+        <div class="form-grid">
+          <label class="compact-field">
+            <span>统一新密码 <small>留空则每个账号随机生成</small></span>
+            <input id="pwBatchNew" type="text" spellcheck="false" autocomplete="off" placeholder="至少 8 位，可留空">
+          </label>
+        </div>
+        <div class="runtime-row" data-admin-only="true" hidden>
+          <label class="compact-field concurrency-field">
+            <span>并发数 <small>管理员可临时调整</small></span>
+            <input id="pwConcurrency" type="number" min="1" max="20" step="1" value="2">
+          </label>
+          <p class="runtime-note">代理池在「设置」页配置，添加密码时会用邮箱收验证码。</p>
+        </div>
+        <div class="action-row">
+          <button class="primary-button" id="pwStart" type="button">开始添加</button>
+          <button class="secondary-button" id="pwCancel" type="button" disabled>取消任务</button>
+          <p class="action-note">添加密码用邮箱收验证码。已有 GPT 密码请用下面的单条改密。</p>
+        </div>
+      </section>
+
+      <section class="run-band">
+        <div class="metrics" aria-label="添加密码统计">
+          <div><strong id="pwTotal">0</strong><span>总数</span></div>
+          <div><strong id="pwRunning">0</strong><span>处理中</span></div>
+          <div><strong id="pwSuccess">0</strong><span>成功</span></div>
+          <div><strong id="pwFailed">0</strong><span>失败</span></div>
+        </div>
+        <div class="table-toolbar">
+          <div class="filter-tabs" role="tablist" aria-label="添加密码筛选">
+            <button class="filter-tab is-active" id="pwFilterAll" type="button" data-pw-filter="all">全部</button>
+            <button class="filter-tab" id="pwFilterFailed" type="button" data-pw-filter="failed">仅失败</button>
+          </div>
+          <div class="table-actions">
+            <button class="icon-text-button" id="pwCopyFailed" type="button" disabled>复制失败邮箱</button>
+            <button class="icon-text-button" id="pwRetrySelected" type="button" disabled>重试所选</button>
+            <button class="icon-text-button" id="pwRetryFailed" type="button" disabled>重试全部失败</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="job-table">
+            <thead><tr>
+              <th class="select-col"><input type="checkbox" id="selectAllPw" aria-label="全选可重试账号"></th>
+              <th>账号</th><th>当前步骤</th><th>状态</th><th>耗时</th><th>说明</th><th>操作</th>
+            </tr></thead>
+            <tbody id="pwBody">
+              <tr class="empty-row"><td colspan="7">开始任务后，这里会逐项显示进度。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="result-band" aria-labelledby="pw-result-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">成功结果</p>
+            <h2 id="pw-result-title">新密码输出</h2>
+          </div>
+          <div class="result-actions">
+            <button class="icon-text-button copy-all-button" id="pwCopyResults" type="button" disabled>一键复制全部</button>
+            <button class="icon-text-button" id="pwDownloadResults" type="button" disabled>下载</button>
+            <button class="icon-text-button" id="pwExportExcel" type="button" disabled>导出 Excel</button>
+          </div>
+        </div>
+        <div class="session-list" id="pwResultList">
+          <p class="session-empty">成功添加的账号会按 邮箱----GPT密码----邮箱密码 显示在这里。</p>
+        </div>
+      </section>
+
       <section class="control-band">
         <div class="section-heading">
           <div>
-            <p class="section-kicker">账号维护</p>
-            <h2>修改密码</h2>
+            <p class="section-kicker">单条维护</p>
+            <h2>改密 / 添加一条</h2>
           </div>
         </div>
         <div class="form-grid">
           <label class="compact-field"><span>邮箱</span><input id="pwEmail" type="text" autocomplete="off"></label>
-          <label class="compact-field"><span>当前 GPT 密码</span><input id="pwGpt" type="password" autocomplete="off"></label>
-          <label class="compact-field"><span>当前邮箱密码</span><input id="pwMail" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>当前 GPT 密码 <small>改密必填，添加可留空</small></span><input id="pwGpt" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>当前邮箱密码 <small>添加密码必填</small></span><input id="pwMail" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>Session Token <small>仅改密可选</small></span><input id="pwSession" type="text" autocomplete="off"></label>
           <label class="compact-field"><span>TOTP Secret（GPT 改密如需）</span><input id="pwSecret" type="text" autocomplete="off"></label>
-          <label class="compact-field"><span>新密码</span><input id="pwNew" type="password" autocomplete="off"></label>
+          <label class="compact-field"><span>新密码 <small>添加时留空则随机生成</small></span><input id="pwNew" type="password" autocomplete="off"></label>
           <label class="compact-field"><span>代理（可选）</span><input id="pwProxy" type="text" placeholder="socks5://..."></label>
         </div>
         <div class="action-row">
-          <button class="primary-button" id="pwGptBtn" type="button">改 GPT 密码</button>
+          <button class="primary-button" id="pwAddBtn" type="button">添加 GPT 密码</button>
+          <button class="secondary-button" id="pwGptBtn" type="button">改 GPT 密码</button>
           <button class="secondary-button" id="pwMailBtn" type="button">改邮箱密码</button>
         </div>
-        <pre class="tool-output" id="pwOutput">改密成功后请立刻更新本地记录。</pre>
+        <pre class="tool-output" id="pwOutput">添加或改密成功后请立刻更新本地记录。</pre>
       </section>
     </div>
 
@@ -327,6 +418,7 @@
             <button class="filter-tab is-active" type="button" data-history-kind="">全部</button>
             <button class="filter-tab" type="button" data-history-kind="session">取 Session</button>
             <button class="filter-tab" type="button" data-history-kind="check">验活</button>
+            <button class="filter-tab" type="button" data-history-kind="password">添加密码</button>
           </div>
         </div>
 
@@ -607,6 +699,6 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/app.js?v=11"></script>
+  <script type="module" src="/app.js?v=19"></script>
 </body>
 </html>

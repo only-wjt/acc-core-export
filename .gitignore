@@ -9,3 +9,4 @@ captures/
 deploy/.env
 .env
 dist/
+.claude/plans/myagents/

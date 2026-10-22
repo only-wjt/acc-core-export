@@ -102,6 +102,32 @@ export function getOpenApiDocs({
         },
       },
       {
+        id: 'passwords-create',
+        method: 'POST',
+        path: '/openapi/v1/passwords',
+        auth: true,
+        summary: '批量给无密码号添加 GPT 密码。输入邮箱+邮箱密码，可选 session；立即返回任务 id',
+        body: {
+          accounts: [{ email: 'a@mail.com', mailPassword: '邮箱密码' }],
+          newPassword: '',
+        },
+        altBody: { input: 'a@mail.com:邮箱密码' },
+        response: { id: '任务id', kind: 'password', status: 'running' },
+      },
+      {
+        id: 'passwords-get',
+        method: 'GET',
+        path: '/openapi/v1/passwords/{id}',
+        auth: true,
+        summary: '查询添加密码任务。成功项 line 为 邮箱----GPT密码----邮箱密码',
+        body: null,
+        response: {
+          id: '任务id',
+          status: 'completed',
+          items: [{ email: 'a@mail.com', status: 'success', line: 'a@mail.com----新密码----邮箱密码' }],
+        },
+      },
+      {
         id: 'totp',
         method: 'POST',
         path: '/openapi/v1/totp',

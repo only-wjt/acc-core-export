@@ -74,14 +74,49 @@ function presentCheckJob(job) {
   };
 }
 
+function mailAccountsToInput(accounts) {
+  if (!Array.isArray(accounts) || !accounts.length) return '';
+  return accounts.map((item) => {
+    const email = String(item?.email || '').trim();
+    const mailPassword = String(item?.mailPassword || item?.emailPassword || item?.password || '').trim();
+    const sessionToken = String(item?.sessionToken || item?.session || '').trim();
+    if (email && mailPassword && sessionToken) return `${email}----${mailPassword}----${sessionToken}`;
+    if (email && mailPassword) return `${email}:${mailPassword}`;
+    return email;
+  }).join('\n');
+}
+
+function presentPasswordJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    kind: 'password',
+    status: job.status,
+    createdAt: job.createdAt,
+    finishedAt: job.finishedAt,
+    concurrency: job.concurrency,
+    counts: job.counts,
+    items: (job.items || []).map((item) => ({
+      email: item.email,
+      status: item.status,
+      stage: item.stage || '',
+      error: item.error || '',
+      line: item.status === 'success' ? item.resultLine || null : null,
+    })),
+    lines: job.results || [],
+  };
+}
+
 export function createOpenApi({
   apiKeys,
   manager,
   checkManager,
+  passwordManager,
   jobOwners,
   adminSettings,
   gpt,
   mail,
+  authorizeCodex = null,
   corsOrigin = process.env.OPENAPI_CORS || '*',
 } = {}) {
   function headers(extra = {}) {
@@ -135,6 +170,22 @@ export function createOpenApi({
     if (result.ok) jobOwners.set(result.job.id, key.owner);
     return result.ok
       ? { status: 202, data: presentSessionJob(result.job) }
+      : { status: 400, data: { error: '请求无效', errors: result.errors } };
+  }
+
+  function createPasswordJob(req, body) {
+    if (!passwordManager) return { status: 404, data: { error: '接口不存在' } };
+    const key = client(req);
+    const input = String(body?.input || '').trim() || mailAccountsToInput(body?.accounts);
+    const result = passwordManager.create({
+      input,
+      newPassword: body?.newPassword || '',
+      proxies: adminSettings.get().proxyText,
+      concurrency: Math.max(1, Math.min(apiKeys.concurrencyLimit, key.concurrency)),
+    });
+    if (result.ok) jobOwners.set(result.job.id, key.owner);
+    return result.ok
+      ? { status: 202, data: presentPasswordJob(result.job) }
       : { status: 400, data: { error: '请求无效', errors: result.errors } };
   }
 
@@ -248,12 +299,78 @@ export function createOpenApi({
       }
     }
 
+    if (req.method === 'POST' && url.pathname === '/openapi/v1/passwords') {
+      const result = createPasswordJob(req, body);
+      send(res, result.status, result.data);
+      return true;
+    }
+
+    const passwordMatch = url.pathname.match(/^\/openapi\/v1\/passwords\/([0-9a-f-]+)(?:\/(cancel))?$/i);
+    if (passwordMatch && passwordManager) {
+      if (!owns(req, passwordMatch[1])) {
+        send(res, 404, { error: '任务不存在或无权查看' });
+        return true;
+      }
+      if (req.method === 'GET' && !passwordMatch[2]) {
+        const job = passwordManager.get(passwordMatch[1]);
+        send(res, job ? 200 : 404, job ? presentPasswordJob(job) : { error: '任务不存在或已清理' });
+        return true;
+      }
+      if (req.method === 'POST' && passwordMatch[2] === 'cancel') {
+        const job = passwordManager.cancel(passwordMatch[1]);
+        send(res, job ? 200 : 404, job ? presentPasswordJob(job) : { error: '任务不存在或已清理' });
+        return true;
+      }
+    }
+
     if (req.method === 'POST' && url.pathname === '/openapi/v1/totp') {
       try {
         const code = gpt.totpCode(body.totpSecret);
         send(res, 200, { code, remainingMs: 30000 - (Date.now() % 30000) });
       } catch (error) {
         send(res, 400, { error: error.message || 'TOTP 无效' });
+      }
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/openapi/v1/codex/authorize') {
+      if (typeof authorizeCodex !== 'function') {
+        send(res, 503, { error: '登录授权没有接上' });
+        return true;
+      }
+      const email = String(body?.email || '').trim();
+      const mailPassword = String(body?.mailPassword || '');
+      if (!email || !mailPassword) {
+        send(res, 400, { error: '缺少邮箱或邮箱密码' });
+        return true;
+      }
+      try {
+        const result = await authorizeCodex({
+          email,
+          mailPassword,
+          gptPassword: String(body?.gptPassword || ''),
+          proxy: body?.proxyUrl || null,
+          groupId: Number(body?.groupId) || 0,
+          accountId: Number(body?.sub2apiAccountId || body?.accountId) || 0,
+          concurrency: Number(body?.concurrency) || 3,
+          skipTest: Boolean(body?.skipTest),
+          s2Base: process.env.S2_BASE || 'http://127.0.0.1:8080',
+          s2Key: process.env.S2_KEY || '',
+          log: () => {},
+        });
+        send(res, 200, result || {});
+      } catch (error) {
+        const msg = String(error?.message || error);
+        if (msg.includes('同一邮箱正在授权')) {
+          send(res, 409, { error: msg });
+          return true;
+        }
+        const id = msg.match(/id=(\d+)/);
+        if (id && msg.includes('访问测试没通过')) {
+          send(res, 200, { accountId: Number(id[1]), schedulable: false, error: msg });
+          return true;
+        }
+        send(res, 400, { error: msg });
       }
       return true;
     }

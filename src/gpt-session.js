@@ -12,6 +12,29 @@ import { extractSessionToken, extractRotatedSessionCookie } from './session-toke
 import { getCfClearance } from './cf-solver.js';
 import { buildSentinelToken, fetchSoToken } from './sentinel.js';
 
+function csrfFailHint(raw) {
+  const text = String(raw || '');
+  if (/^\s*</.test(text) || /cloudflare|cf-ray|just a moment|attention required|challenge-platform/i.test(text)) {
+    return '被拦截';
+  }
+  if (!text.trim()) return '空响应';
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data === 'object' && !data.csrfToken) return '响应无token';
+  } catch {
+    return '非JSON';
+  }
+  return '无token';
+}
+
+async function readCsrfToken(resp, where = '获取 csrfToken 失败') {
+  const raw = await resp.text().catch(() => '');
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch { data = null; }
+  if (data?.csrfToken) return data.csrfToken;
+  throw new Error(`${where}(${resp.status || 0}:${csrfFailHint(raw)})`);
+}
+
 // RFC 6238 TOTP (SHA-1, 30s, 6 digits). secret = base32 (OpenAI authenticator).
 export function totpCode(secret, atMs = Date.now()) {
   const s = String(secret || '').toUpperCase().replace(/[\s=-]+/g, '');
@@ -282,6 +305,7 @@ export async function login(account, {
   proxy = null,
   log = () => {},
   tokenProvider = null,
+  onAuth0Ready = null,
 }) {
   const oaiDid = uuid();
   let fp = accountFp(account);
@@ -320,8 +344,7 @@ export async function login(account, {
     redirect: 'manual',
   });
   jar = mergeCookies(jar, extractCookies(csrfResp));
-  const csrfData = await csrfResp.json();
-  if (!csrfData.csrfToken) throw new Error('获取 csrfToken 失败');
+  const csrfDataToken = await readCsrfToken(csrfResp);
 
   // Step 2: 预热 POST 获取 __Host-next-auth.csrf-token cookie
   log('建立 CSRF 会话…');
@@ -333,7 +356,7 @@ export async function login(account, {
       'Origin': BASE,
       'Referer': `${BASE}/auth/login`,
     }),
-    body: `callbackUrl=%2F&csrfToken=${encodeURIComponent(csrfData.csrfToken)}&json=true`,
+    body: `callbackUrl=%2F&csrfToken=${encodeURIComponent(csrfDataToken)}&json=true`,
     redirect: 'manual',
   });
   jar = mergeCookies(jar, extractCookies(warmupResp));
@@ -344,8 +367,7 @@ export async function login(account, {
     redirect: 'manual',
   });
   jar = mergeCookies(jar, extractCookies(csrfResp2));
-  const csrfToken = (await csrfResp2.json()).csrfToken;
-  if (!csrfToken) throw new Error('第二次获取 csrfToken 失败');
+  const csrfToken = await readCsrfToken(csrfResp2, '第二次获取 csrfToken 失败');
 
   // Step 4: signin with prompt=login & login_hint=邮箱
   log('发起登录认证…');
@@ -620,6 +642,13 @@ export async function login(account, {
     if (createResp.status < 400 && createData?.continue_url) lastData = createData;
   }
 
+  // 登录态已在 auth.openai.com 上：此时 cookie 还能接着走 Codex / Sub2API 授权。
+  if (typeof onAuth0Ready === 'function') {
+    log('auth.openai.com 已登录，执行额外授权…');
+    const extra = await onAuth0Ready({ authFetch, auth0Jar, oaiDid });
+    if (extra?.auth0Jar) auth0Jar = extra.auth0Jar;
+  }
+
   // Step 6: 跟踪回调链回到 chatgpt.com，拿 session-token
   log('跟踪回调链…');
   let redirectUrl = lastData?.continue_url || '';
@@ -664,20 +693,43 @@ export async function login(account, {
   const accountId = accounts.default?.account?.account_id || Object.values(accounts)[0]?.account?.account_id || null;
 
   log('登录完成 ✓');
-  return { ok: true, sessionToken, accountId, accessToken, sessionJson, fp };
+  return { ok: true, sessionToken, accountId, accessToken, sessionJson, fp, auth0Jar };
 }
 
 
-// ───── 修改GPT密码(已知当前密码) ─────
-// 流程(HAR): signin(connection=password,post_login_password_reset=true,max_age=0)
-//   → authorize → /log-in/password → password/verify(当前密码) → [mfa] → password/reset → callback
-// 对齐 login：authorize 不把 chatgpt.com cookie 带给 auth.openai.com；Auth0 API 带 oai-device-id。
+export function generateGptPassword(length = 14) {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghijkmnopqrstuvwxyz';
+  const digits = '23456789';
+  const all = `${upper}${lower}${digits}`;
+  const pick = (alphabet) => alphabet[crypto.randomInt(alphabet.length)];
+  const size = Math.max(8, Math.min(64, Number(length) || 14));
+  const chars = [pick(upper), pick(lower), pick(digits)];
+  for (let i = chars.length; i < size; i++) chars.push(pick(all));
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
+
+export function assertGptPassword(password) {
+  const value = String(password || '');
+  if (value.length < 8) throw new Error('GPT 密码至少 8 位');
+  if (value.length > 128) throw new Error('GPT 密码过长');
+  return value;
+}
+
+// ───── 修改/添加 GPT 密码 ─────
+// 有当前密码: signin(post_login_password_reset) → /log-in/password → password/verify → [mfa] → password/reset
+// 无密码号不要走这条：post_login_password_reset 是改已有密码，会 change_password_ineligible。
 
 export async function changePassword(account, {
   currentPassword,
   newPassword,
   proxy = null,
   totpSecret = null,
+  getOtp = null,
   log = () => {},
 }) {
   const oaiDid = uuid();
@@ -706,7 +758,7 @@ export async function changePassword(account, {
     redirect: 'manual',
   });
   jar = mergeCookies(jar, extractCookies(csrfResp0));
-  const csrf0 = (await csrfResp0.json()).csrfToken;
+  const csrf0 = await readCsrfToken(csrfResp0);
 
   log('建立 CSRF 会话…');
   const warmupResp = await authFetch(`${BASE}/api/auth/signin/openai`, {
@@ -725,8 +777,7 @@ export async function changePassword(account, {
     redirect: 'manual',
   });
   jar = mergeCookies(jar, extractCookies(csrfResp));
-  const csrfToken = (await csrfResp.json()).csrfToken;
-  if (!csrfToken) throw new Error('获取 csrfToken 失败');
+  const csrfToken = await readCsrfToken(csrfResp);
 
   log('发起改密码认证…');
   const signinUrl = `${BASE}/api/auth/signin/openai?connection=password&login_hint=${encodeURIComponent(account.email)}&reauth=password&post_login_password_reset=true&max_age=0`;
@@ -755,6 +806,8 @@ export async function changePassword(account, {
   });
   let auth0Jar = extractCookies(authResp);
   let location = authResp.headers.get('location') || '';
+  const landingPage = location;
+  let lastUrl = location;
   log(`[DEBUG] authorize status=${authResp.status} landing=${location.slice(0, 120)} ck_len=${auth0Jar.length}`);
   if (authResp.status === 429) {
     throw new Error('改密 authorize 429(限流)，请稍后/换代理重试');
@@ -764,6 +817,7 @@ export async function changePassword(account, {
   }
   while (location) {
     const u = location.startsWith('http') ? location : `${AUTH0}${location}`;
+    lastUrl = u;
     log(`[DEBUG] redirect → ${u.slice(0, 120)}`);
     const s = await authFetch(u, {
       headers: headers({ Cookie: auth0Jar, Referer: AUTH0, ...traceHeaders(), 'oai-device-id': oaiDid }),
@@ -775,53 +829,143 @@ export async function changePassword(account, {
   }
   if (!auth0Jar) throw new Error('改密 authorize 未拿到 auth0 cookie');
 
-  log('验证当前密码…');
-  const verifyResp = await authFetch(`${AUTH0}/api/accounts/password/verify`, {
-    method: 'POST',
-    headers: auth0ApiHeaders({
-      Cookie: auth0Jar,
-      Referer: `${AUTH0}/log-in/password`,
-    }),
-    body: JSON.stringify({ password: currentPassword }),
-    redirect: 'manual',
-  });
-  auth0Jar = mergeCookies(auth0Jar, extractCookies(verifyResp));
-  let verifyData = await verifyResp.json().catch(() => null);
-  log(`[DEBUG] password/verify status=${verifyResp.status} page=${verifyData?.page?.type || ''}`);
-  if (verifyResp.status >= 400) {
-    throw new Error(`当前密码验证失败(${verifyResp.status}): ${JSON.stringify(verifyData).slice(0, 300)}`);
+  const pageHint = `${landingPage} ${lastUrl}`;
+  if (pageHint.includes('/create-account') && !pageHint.includes('about-you')) {
+    throw new Error('OpenAI账号不存在(邮箱未注册)');
   }
-  // 部分号开启 TOTP：password/verify 后落到 mfa_challenge，需先过 2FA 再 reset
-  if (verifyData?.page?.type === 'mfa_challenge') {
-    const factors = verifyData?.page?.payload?.factors || [];
-    const totpFactor = factors.find((f) => f?.factor_type === 'totp')
-      || factors.find((f) => f?.id && f.id === verifyData?.page?.payload?.factor_id)
-      || null;
-    const factorId = totpFactor?.id || verifyData?.page?.payload?.factor_id || null;
-    if (!factorId) throw new Error('改密流程 mfa_challenge 无 totp factor id');
-    if (!resolvedTotp) throw new Error('改密需要 TOTP(账号未存 totpSecret)');
-    const code = totpCode(resolvedTotp);
-    log(`改密前 MFA TOTP: ${code} factor=${String(factorId).slice(0, 12)}…`);
-    const mfaResp = await authFetch(`${AUTH0}/api/accounts/mfa/verify`, {
+
+  const submitOtp = async (referer = `${AUTH0}/email-verification`) => {
+    if (typeof getOtp !== 'function') throw new Error('需要邮箱 OTP 但未提供 getOtp');
+    log('等待邮箱验证码…');
+    let code = await getOtp();
+    if (!code) {
+      log('未收到OTP，请求重发…');
+      const resendResp = await authFetch(`${AUTH0}/api/accounts/email-otp/resend`, {
+        method: 'POST',
+        headers: auth0ApiHeaders({
+          Cookie: auth0Jar,
+          Referer: referer,
+        }),
+        body: JSON.stringify({}),
+        redirect: 'manual',
+      });
+      auth0Jar = mergeCookies(auth0Jar, extractCookies(resendResp));
+      log(`[DEBUG] 改密 resend OTP status=${resendResp.status}`);
+      code = await getOtp();
+      if (!code) throw new Error('没拿到邮箱验证码(检查关联 mail 账号)');
+    }
+    log(`提交验证码: ${code}`);
+    const otpResp = await authFetch(`${AUTH0}/api/accounts/email-otp/validate`, {
       method: 'POST',
       headers: auth0ApiHeaders({
         Cookie: auth0Jar,
-        Referer: `${AUTH0}/mfa-challenge/${factorId}`,
+        Referer: referer,
       }),
-      body: JSON.stringify({ type: 'totp', id: factorId, code }),
+      body: JSON.stringify({ code }),
       redirect: 'manual',
     });
-    auth0Jar = mergeCookies(auth0Jar, extractCookies(mfaResp));
-    const mfaData = await mfaResp.json().catch(() => null);
-    log(`[DEBUG] 改密 mfa/verify status=${mfaResp.status} page=${mfaData?.page?.type || ''}`);
-    if (mfaResp.status >= 400) {
-      throw new Error(`改密 MFA 失败(${mfaResp.status}): ${JSON.stringify(mfaData).slice(0, 240)}`);
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(otpResp));
+    const otpData = await otpResp.json().catch(() => null);
+    log(`[DEBUG] 改密 otp/validate status=${otpResp.status} page=${otpData?.page?.type || ''}`);
+    if (otpResp.status >= 400) {
+      throw new Error(`OTP验证失败(${otpResp.status}): ${JSON.stringify(otpData).slice(0, 300)}`);
     }
-    verifyData = mfaData || verifyData;
+    return otpData;
+  };
+
+  const sendEmailOtp = async (referer = `${AUTH0}/log-in/password`) => {
+    let otpSendResp = await authFetch(`${AUTH0}/api/accounts/email-otp/send`, {
+      headers: headers({
+        ...traceHeaders(), 'oai-device-id': oaiDid,
+        Cookie: auth0Jar, Referer: referer,
+      }),
+      redirect: 'manual',
+    });
+    log(`[DEBUG] 改密 OTP send(GET) status=${otpSendResp.status}`);
+    if (otpSendResp.status >= 400) {
+      otpSendResp = await authFetch(`${AUTH0}/api/accounts/email-otp/resend`, {
+        method: 'POST',
+        headers: auth0ApiHeaders({
+          Cookie: auth0Jar,
+          Referer: `${AUTH0}/email-verification`,
+        }),
+        body: JSON.stringify({}),
+        redirect: 'manual',
+      });
+      log(`[DEBUG] 改密 OTP resend status=${otpSendResp.status}`);
+    }
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(otpSendResp));
+    if (otpSendResp.status >= 400) {
+      throw new Error(`无法发送邮箱验证码(${otpSendResp.status})`);
+    }
+  };
+
+  let verifyData = null;
+  if (/reset-password/i.test(pageHint)) {
+    log('已进入重置密码页…');
+  } else if (/email-verification|email-otp/i.test(pageHint)) {
+    log('无密码账号，OTP已发送，等待邮箱验证码…');
+    verifyData = await submitOtp();
+  } else if (currentPassword) {
+    log('验证当前密码…');
+    const verifyResp = await authFetch(`${AUTH0}/api/accounts/password/verify`, {
+      method: 'POST',
+      headers: auth0ApiHeaders({
+        Cookie: auth0Jar,
+        Referer: `${AUTH0}/log-in/password`,
+      }),
+      body: JSON.stringify({ password: currentPassword }),
+      redirect: 'manual',
+    });
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(verifyResp));
+    verifyData = await verifyResp.json().catch(() => null);
+    log(`[DEBUG] password/verify status=${verifyResp.status} page=${verifyData?.page?.type || ''}`);
+    if (verifyResp.status >= 400) {
+      if (typeof getOtp !== 'function') {
+        throw new Error(`当前密码验证失败(${verifyResp.status}): ${JSON.stringify(verifyData).slice(0, 300)}`);
+      }
+      log('当前密码验证失败，改为邮箱 OTP…');
+      await sendEmailOtp();
+      verifyData = await submitOtp();
+    } else if (verifyData?.page?.type === 'mfa_challenge') {
+      const factors = verifyData?.page?.payload?.factors || [];
+      const totpFactor = factors.find((f) => f?.factor_type === 'totp')
+        || factors.find((f) => f?.id && f.id === verifyData?.page?.payload?.factor_id)
+        || null;
+      const factorId = totpFactor?.id || verifyData?.page?.payload?.factor_id || null;
+      if (!factorId) throw new Error('改密流程 mfa_challenge 无 totp factor id');
+      if (!resolvedTotp) throw new Error('改密需要 TOTP(账号未存 totpSecret)');
+      const code = totpCode(resolvedTotp);
+      log(`改密前 MFA TOTP: ${code} factor=${String(factorId).slice(0, 12)}…`);
+      const mfaResp = await authFetch(`${AUTH0}/api/accounts/mfa/verify`, {
+        method: 'POST',
+        headers: auth0ApiHeaders({
+          Cookie: auth0Jar,
+          Referer: `${AUTH0}/mfa-challenge/${factorId}`,
+        }),
+        body: JSON.stringify({ type: 'totp', id: factorId, code }),
+        redirect: 'manual',
+      });
+      auth0Jar = mergeCookies(auth0Jar, extractCookies(mfaResp));
+      const mfaData = await mfaResp.json().catch(() => null);
+      log(`[DEBUG] 改密 mfa/verify status=${mfaResp.status} page=${mfaData?.page?.type || ''}`);
+      if (mfaResp.status >= 400) {
+        throw new Error(`改密 MFA 失败(${mfaResp.status}): ${JSON.stringify(mfaData).slice(0, 240)}`);
+      }
+      verifyData = mfaData || verifyData;
+    } else if (verifyData?.page?.type === 'email_otp_verification') {
+      verifyData = await submitOtp();
+    }
+  } else if (typeof getOtp === 'function') {
+    log('无当前密码，改为邮箱 OTP 验证…');
+    await sendEmailOtp();
+    verifyData = await submitOtp();
+  } else {
+    throw new Error('改密需要当前 GPT 密码，或提供邮箱 OTP 以添加密码');
   }
 
   // 落到 reset 页时先 GET 一下，带上 continue_url 的 cookie
-  const contAfterVerify = String(verifyData?.continue_url || '');
+  const contAfterVerify = String(verifyData?.continue_url || lastUrl || '');
   if (contAfterVerify.includes('reset-password') || verifyData?.page?.type === 'reset_password_new_password') {
     const u = contAfterVerify.startsWith('http') ? contAfterVerify : `${AUTH0}${contAfterVerify || '/reset-password/new-password'}`;
     const s = await authFetch(u, {
@@ -844,16 +988,23 @@ export async function changePassword(account, {
   });
   auth0Jar = mergeCookies(auth0Jar, extractCookies(resetResp));
   const resetData = await resetResp.json().catch(() => null);
-  log(`[DEBUG] password/reset status=${resetResp.status} page=${resetData?.page?.type || ''}`);
+  log(`[DEBUG] password/reset status=${resetResp.status} page=${resetData?.page?.type || ''} code=${resetData?.error?.code || ''}`);
   if (resetResp.status >= 400) {
+    if (resetData?.error?.code === 'change_password_ineligible') {
+      throw new Error('该账号不允许走设置内改密（change_password_ineligible）。无密码号请用忘记密码流添加密码。');
+    }
     throw new Error(`修改密码失败(${resetResp.status}): ${JSON.stringify(resetData).slice(0, 300)}`);
   }
-  // iCloud 等无邮箱接码：reset 后若要 email OTP，协议无法完成
   if (resetData?.page?.type === 'email_otp_verification'
     || String(resetData?.continue_url || '').includes('email-verification')) {
-    const err = new Error('改密需要邮箱 OTP（iCloud 等无接码邮箱无法完成协议改密）');
-    err.code = 'password_reset_needs_email_otp';
-    throw err;
+    if (typeof getOtp !== 'function') {
+      const err = new Error('改密需要邮箱 OTP（iCloud 等无接码邮箱无法完成协议改密）');
+      err.code = 'password_reset_needs_email_otp';
+      throw err;
+    }
+    log('改密后还需要邮箱 OTP…');
+    const otpAfterReset = await submitOtp(`${AUTH0}/email-verification`);
+    if (otpAfterReset?.continue_url) resetData.continue_url = otpAfterReset.continue_url;
   }
 
   log('跟踪回调链…');
@@ -875,6 +1026,400 @@ export async function changePassword(account, {
 
   log('密码修改完成 ✓');
   return { ok: true };
+}
+
+function grantHint(data, loc = '') {
+  return `${data?.page?.type || ''} ${data?.continue_url || ''} ${loc || ''}`;
+}
+
+function isWritePasswordGrant(data, loc = '') {
+  return /reset_password|reset-password|forgot-password|create_account_password/i.test(grantHint(data, loc));
+}
+
+function isOtpGrantPage(data, loc = '') {
+  return /email_otp_verification|email-verification|email-otp/i.test(grantHint(data, loc));
+}
+
+function resetContinueBodies(email) {
+  const username = { value: email, kind: 'email' };
+  return [
+    { username, screen_hint: 'reset-password' },
+    { username, screen_hint: 'forgot-password' },
+    { username, screen_hint: 'forgot_password' },
+    { screen_hint: 'reset-password' },
+    { username, screen_hint: 'add-password' },
+    { username, screen_hint: 'set-password' },
+  ];
+}
+
+function assertWritePasswordGrant(data, loc, where = '设密') {
+  if (isWritePasswordGrant(data, loc)) return;
+  const hint = grantHint(data, loc);
+  if (/callback|chatgpt\.com/i.test(hint) && !/reset-password|add-password/i.test(hint)) {
+    throw new Error(`${where}验证后仍是登录授权，不是设密授权。不能调用 password/reset（会 change_password_ineligible）`);
+  }
+}
+
+async function startPasswordAuthSession(account, {
+  signinQuery,
+  referer,
+  callbackUrl,
+  sessionToken = '',
+  proxy = null,
+  log = () => {},
+  label = '设密',
+} = {}) {
+  const oaiDid = uuid();
+  const fp = accountFp(account);
+  const authFetch = (url, opts = {}) =>
+    ctlsFetch(url, { ...opts, headers: applyFp(opts.headers || {}, fp), ja3: fp.ja3 }, proxy);
+  let jar = '';
+  if (sessionToken) {
+    try { jar = buildSessionCookie(sessionToken); } catch { jar = ''; }
+  }
+
+  log('获取 CSRF token…');
+  const csrfResp = await authFetch(`${BASE}/api/auth/csrf`, {
+    headers: browserHeaders({ Referer: referer, ...(jar ? { Cookie: jar } : {}) }),
+    redirect: 'manual',
+  });
+  jar = mergeCookies(jar, extractCookies(csrfResp));
+  const csrf0 = await readCsrfToken(csrfResp);
+
+  log('建立 CSRF 会话…');
+  const warmupResp = await authFetch(`${BASE}/api/auth/signin/openai`, {
+    method: 'POST',
+    headers: browserHeaders({
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Cookie: jar, Origin: BASE, Referer: referer,
+    }),
+    body: `callbackUrl=${encodeURIComponent(callbackUrl)}&csrfToken=${encodeURIComponent(csrf0)}&json=true`,
+    redirect: 'manual',
+  });
+  jar = mergeCookies(jar, extractCookies(warmupResp));
+  const csrfResp2 = await authFetch(`${BASE}/api/auth/csrf`, {
+    headers: browserHeaders({ Cookie: jar, Referer: referer }),
+    redirect: 'manual',
+  });
+  jar = mergeCookies(jar, extractCookies(csrfResp2));
+  const csrfToken = await readCsrfToken(csrfResp2, '第二次获取 csrfToken 失败');
+
+  log(`发起${label}认证…`);
+  const signinResp = await authFetch(`${BASE}/api/auth/signin/openai?${signinQuery}`, {
+    method: 'POST',
+    headers: browserHeaders({
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Cookie: jar, Origin: BASE, Referer: referer,
+    }),
+    body: `callbackUrl=${encodeURIComponent(callbackUrl)}&csrfToken=${encodeURIComponent(csrfToken)}&json=true`,
+    redirect: 'manual',
+  });
+  jar = mergeCookies(jar, extractCookies(signinResp));
+  const signinJson = await signinResp.json().catch(() => null);
+  const authorizeUrl = signinJson?.url;
+  if (!authorizeUrl || authorizeUrl.includes('error') || authorizeUrl.includes('csrf=true')) {
+    throw new Error(`获取 authorize URL 失败: ${JSON.stringify(signinJson)}`);
+  }
+
+  log('跳转 authorize…');
+  const authResp = await authFetch(authorizeUrl, {
+    headers: headers({ Referer: BASE, ...traceHeaders(), 'oai-device-id': oaiDid }),
+    redirect: 'manual',
+  });
+  let auth0Jar = extractCookies(authResp);
+  let location = authResp.headers.get('location') || '';
+  let lastUrl = location;
+  if (authResp.status === 429) throw new Error(`${label} authorize 429(限流)，请稍后/换代理重试`);
+  while (location) {
+    const u = location.startsWith('http') ? location : `${AUTH0}${location}`;
+    lastUrl = u;
+    const step = await authFetch(u, {
+      headers: headers({ Cookie: auth0Jar, Referer: AUTH0, ...traceHeaders(), 'oai-device-id': oaiDid }),
+      redirect: 'manual',
+    });
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(step));
+    if (step.status >= 300 && step.status < 400) location = step.headers.get('location') || '';
+    else break;
+  }
+  if (!auth0Jar) throw new Error(`${label} authorize 未拿到 auth0 cookie`);
+  log(`[DEBUG] ${label} landing=${lastUrl.slice(0, 120)}`);
+  if (lastUrl.includes('/create-account') && !lastUrl.includes('about-you')) {
+    throw new Error('OpenAI账号不存在(邮箱未注册)');
+  }
+  return { oaiDid, fp, authFetch, jar, auth0Jar, lastUrl };
+}
+
+async function requestPasswordWriteGrant(session, email, {
+  referer = `${AUTH0}/log-in/password`,
+  proxy = null,
+  log = () => {},
+} = {}) {
+  let { authFetch, auth0Jar, lastUrl, oaiDid, fp } = session;
+  if (isWritePasswordGrant(null, lastUrl) || isOtpGrantPage(null, lastUrl)) {
+    return { ...session, data: { continue_url: lastUrl } };
+  }
+
+  log('申请设密授权…');
+  for (const body of resetContinueBodies(email)) {
+    const send = async (extra = {}) => authFetch(`${AUTH0}/api/accounts/authorize/continue`, {
+      method: 'POST',
+      headers: headers({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Origin: AUTH0,
+        Cookie: auth0Jar,
+        Referer: referer,
+        ...traceHeaders(),
+        'oai-device-id': oaiDid,
+        ...extra,
+      }),
+      body: JSON.stringify(body),
+      redirect: 'manual',
+    });
+    let resp = await send();
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(resp));
+    let raw = await resp.text().catch(() => '');
+    if ((resp.status === 400 || resp.status === 403) && /sentinel/i.test(raw)) {
+      const token = await buildSentinelToken(oaiDid, { flow: 'authorize_continue', fp, proxy });
+      resp = await send({ 'openai-sentinel-token': token });
+      auth0Jar = mergeCookies(auth0Jar, extractCookies(resp));
+      raw = await resp.text().catch(() => '');
+    }
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch { data = null; }
+    const loc = resp.headers.get('location') || '';
+    log(`[DEBUG] continue screen_hint=${body.screen_hint || ''} status=${resp.status} page=${data?.page?.type || ''} loc=${loc.slice(0, 80)}`);
+    if (resp.status >= 400 || !data || (!data.page && !data.continue_url && !loc)) continue;
+    if (isWritePasswordGrant(data, loc) || isOtpGrantPage(data, loc)) {
+      if (loc) {
+        const next = loc.startsWith('http') ? loc : `${AUTH0}${loc}`;
+        const hop = await authFetch(next, {
+          headers: headers({ Cookie: auth0Jar, Referer: AUTH0, ...traceHeaders(), 'oai-device-id': oaiDid }),
+          redirect: 'manual',
+        });
+        auth0Jar = mergeCookies(auth0Jar, extractCookies(hop));
+        lastUrl = hop.headers.get('location') || next;
+      } else if (data.continue_url) {
+        lastUrl = data.continue_url.startsWith('http') ? data.continue_url : `${AUTH0}${data.continue_url}`;
+      }
+      return { ...session, auth0Jar, lastUrl, data };
+    }
+  }
+  throw new Error('无法发起忘记密码（未拿到 reset/add 授权。社交登录或企业号不能补密码）');
+}
+
+async function submitPasswordOtp(session, getOtp, {
+  referer = `${AUTH0}/email-verification`,
+  log = () => {},
+} = {}) {
+  let { authFetch, auth0Jar, oaiDid } = session;
+  log('等待邮箱验证码…');
+  let code = await getOtp();
+  if (!code) {
+    const resendResp = await authFetch(`${AUTH0}/api/accounts/email-otp/resend`, {
+      method: 'POST',
+      headers: headers({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Origin: AUTH0,
+        Cookie: auth0Jar,
+        Referer: referer,
+        ...traceHeaders(),
+        'oai-device-id': oaiDid,
+      }),
+      body: JSON.stringify({}),
+      redirect: 'manual',
+    });
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(resendResp));
+    code = await getOtp();
+    if (!code) throw new Error('没拿到邮箱验证码(检查关联 mail 账号)');
+  }
+  log(`提交验证码: ${code}`);
+  const otpResp = await authFetch(`${AUTH0}/api/accounts/email-otp/validate`, {
+    method: 'POST',
+    headers: headers({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Origin: AUTH0,
+      Cookie: auth0Jar,
+      Referer: referer,
+      ...traceHeaders(),
+      'oai-device-id': oaiDid,
+    }),
+    body: JSON.stringify({ code }),
+    redirect: 'manual',
+  });
+  auth0Jar = mergeCookies(auth0Jar, extractCookies(otpResp));
+  const otpData = await otpResp.json().catch(() => null);
+  log(`[DEBUG] otp/validate status=${otpResp.status} page=${otpData?.page?.type || ''} continue=${String(otpData?.continue_url || '').slice(0, 80)}`);
+  if (otpResp.status >= 400) {
+    throw new Error(`OTP验证失败(${otpResp.status}): ${JSON.stringify(otpData).slice(0, 300)}`);
+  }
+  return { ...session, auth0Jar, data: otpData, lastUrl: otpData?.continue_url || session.lastUrl };
+}
+
+async function writeGrantedPassword(session, password, {
+  email,
+  getOtp,
+  log = () => {},
+} = {}) {
+  let { authFetch, auth0Jar, lastUrl, data, oaiDid } = session;
+  assertWritePasswordGrant(data, lastUrl);
+  const cont = String(data?.continue_url || lastUrl || '');
+  if (cont.includes('reset-password') || data?.page?.type === 'reset_password_new_password') {
+    const u = cont.startsWith('http') ? cont : `${AUTH0}${cont || '/reset-password/new-password'}`;
+    const page = await authFetch(u, {
+      headers: headers({ Cookie: auth0Jar, Referer: AUTH0, ...traceHeaders(), 'oai-device-id': oaiDid }),
+      redirect: 'manual',
+    });
+    auth0Jar = mergeCookies(auth0Jar, extractCookies(page));
+    log(`[DEBUG] open reset page status=${page.status}`);
+  }
+
+  const writePath = /create_account_password|create-account\/password/i.test(grantHint(data, lastUrl))
+    ? '/api/accounts/user/register'
+    : '/api/accounts/password/reset';
+  const referer = writePath.includes('register')
+    ? `${AUTH0}/create-account/password`
+    : `${AUTH0}/reset-password/new-password`;
+  const body = writePath.includes('register')
+    ? { password, username: email }
+    : { password };
+
+  log('设置新密码…');
+  const resetResp = await authFetch(`${AUTH0}${writePath}`, {
+    method: 'POST',
+    headers: headers({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Origin: AUTH0,
+      Cookie: auth0Jar,
+      Referer: referer,
+      ...traceHeaders(),
+      'oai-device-id': oaiDid,
+    }),
+    body: JSON.stringify(body),
+    redirect: 'manual',
+  });
+  auth0Jar = mergeCookies(auth0Jar, extractCookies(resetResp));
+  const resetData = await resetResp.json().catch(() => null);
+  log(`[DEBUG] ${writePath} status=${resetResp.status} page=${resetData?.page?.type || ''} code=${resetData?.error?.code || ''}`);
+  if (resetResp.status >= 400) {
+    if (resetData?.error?.code === 'change_password_ineligible') {
+      throw new Error('该账号不允许设置 GPT 密码（change_password_ineligible）。社交登录或企业号无法补密码。');
+    }
+    throw new Error(`修改密码失败(${resetResp.status}): ${JSON.stringify(resetData).slice(0, 300)}`);
+  }
+  if (isOtpGrantPage(resetData, resetData?.continue_url) && typeof getOtp === 'function') {
+    const after = await submitPasswordOtp({ ...session, auth0Jar }, getOtp, { log });
+    return { ok: true, newPassword: password, data: after.data };
+  }
+  log('密码修改完成 ✓');
+  return { ok: true, newPassword: password, data: resetData };
+}
+
+async function completePasswordWrite(session, email, {
+  newPassword,
+  getOtp,
+  proxy = null,
+  log = () => {},
+} = {}) {
+  let current = await requestPasswordWriteGrant(session, email, { proxy, log });
+  if (isOtpGrantPage(current.data, current.lastUrl)) {
+    current = await submitPasswordOtp(current, getOtp, { log });
+  }
+  return writeGrantedPassword(current, newPassword, { email, getOtp, log });
+}
+
+// 官方忘记密码：登出态进密码页，用 authorize/continue 的 screen_hint 换成重置授权，再 OTP + password/reset。
+// 不能走 post_login_password_reset，也不能在登录 OTP 后直接 reset：那是改密授权，无密码号会 ineligible。
+export async function forgotPasswordReset(account, {
+  newPassword,
+  getOtp,
+  proxy = null,
+  log = () => {},
+} = {}) {
+  if (typeof getOtp !== 'function') throw new Error('添加 GPT 密码需要 getOtp（邮箱取码）');
+  const password = assertGptPassword(newPassword);
+  const email = encodeURIComponent(account.email);
+  const session = await startPasswordAuthSession(account, {
+    signinQuery: `prompt=login&connection=password&login_hint=${email}&screen_hint=reset-password`,
+    referer: `${BASE}/auth/login`,
+    callbackUrl: `${BASE}/`,
+    proxy,
+    log,
+    label: '忘记密码',
+  });
+  return completePasswordWrite(session, account.email, { newPassword: password, getOtp, proxy, log });
+}
+
+async function settingsAddPassword(account, {
+  newPassword,
+  getOtp,
+  proxy = null,
+  log = () => {},
+} = {}) {
+  const password = assertGptPassword(newPassword);
+  const email = encodeURIComponent(account.email);
+  const queries = [
+    `connection=password&login_hint=${email}&reauth=password&post_login_add_password=true&max_age=0`,
+    `connection=password&login_hint=${email}&reauth=password&add_password=true&max_age=0`,
+    `connection=password&login_hint=${email}&reauth=password&screen_hint=add-password&max_age=0`,
+  ];
+  let lastError = null;
+  for (const signinQuery of queries) {
+    try {
+      log(`尝试设置内添加（${signinQuery.split('&').slice(2).join('&')}）…`);
+      const session = await startPasswordAuthSession(account, {
+        signinQuery,
+        referer: `${BASE}/#settings/Account`,
+        callbackUrl: `${BASE}/#settings/Account`,
+        sessionToken: account.sessionToken || '',
+        proxy,
+        log,
+        label: '添加密码',
+      });
+      return await completePasswordWrite(session, account.email, { newPassword: password, getOtp, proxy, log });
+    } catch (error) {
+      lastError = error;
+      if (/csrfToken|429|账号不存在/i.test(String(error?.message || error))) throw error;
+      log(`设置内添加未成功: ${error.message}`);
+    }
+  }
+  throw lastError || new Error('设置内添加密码失败');
+}
+
+// 无密码号：先走忘记密码重置授权；拿不到再登录后走 Settings 添加。禁止用改密 reset 硬写。
+export async function addPassword(account, {
+  newPassword,
+  getOtp,
+  proxy = null,
+  log = () => {},
+} = {}) {
+  if (typeof getOtp !== 'function') throw new Error('添加 GPT 密码需要 getOtp（邮箱取码）');
+  const password = assertGptPassword(newPassword || generateGptPassword());
+  log('添加 GPT 密码（忘记密码授权）…');
+  try {
+    return await forgotPasswordReset(account, { newPassword: password, getOtp, proxy, log });
+  } catch (error) {
+    const text = String(error?.message || error);
+    if (/change_password_ineligible|社交登录或企业号无法补密码/i.test(text)) throw error;
+    if (!/无法发起忘记密码|登录授权|未拿到 reset/i.test(text)) throw error;
+    log(`忘记密码流不可用: ${text}`);
+  }
+
+  let sessionToken = account.sessionToken || '';
+  if (!sessionToken) {
+    log('没有 Session，先用邮箱验证码登录…');
+    const logged = await login(account, { getOtp, proxy, log });
+    sessionToken = logged.sessionToken || '';
+  }
+  log('改走设置内添加密码…');
+  const result = await settingsAddPassword(
+    { ...account, sessionToken },
+    { newPassword: password, getOtp, proxy, log },
+  );
+  return { ...result, sessionToken: result.sessionToken || sessionToken };
 }
 
 

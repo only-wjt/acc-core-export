@@ -360,6 +360,46 @@ test('retry can run a failed row while other accounts are still processing', asy
   assert.equal(after.items[1].status, 'success');
 });
 
+test('retry all failed does not exceed concurrency while others are still running', async () => {
+  let active = 0;
+  let peak = 0;
+  const manager = createBatchManager({
+    waitForOTP: async () => '123456',
+    getAccessToken: async (token) => ({ accessToken: `access-${token}`, sessionJson: JSON.stringify({ token }) }),
+    login: async (account) => {
+      active++;
+      peak = Math.max(peak, active);
+      if (account.email.startsWith('slow')) {
+        await wait(50);
+        active--;
+        return { sessionToken: `session-${account.email}` };
+      }
+      await wait(5);
+      active--;
+      throw new Error('fail once');
+    },
+  });
+
+  const created = manager.create({
+    concurrency: 2,
+    input: 'bad1@example.com:m1\nbad2@example.com:m2\nslow1@example.com:m3\nslow2@example.com:m4',
+  });
+
+  for (let i = 0; i < 80; i++) {
+    const snapshot = manager.get(created.job.id);
+    const failed = snapshot.items.filter((item) => item.status === 'failed').length;
+    const running = snapshot.items.filter((item) => item.status === 'running').length;
+    if (failed >= 2 && running >= 1) break;
+    await wait(5);
+  }
+
+  const retried = manager.retry(created.job.id, { failed: true, concurrency: 2 });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.job.concurrency, 2);
+  await waitForDone(manager, created.job.id);
+  assert.ok(peak <= 2, `peak concurrency was ${peak}`);
+});
+
 test('retry all failed accounts without wiping successful sessions', async () => {
   const attempts = new Map();
   const manager = createBatchManager({
@@ -411,6 +451,37 @@ test('failed rows expose an error category for the operator', async () => {
   assert.equal(job.items[0].errorCategory, 'password');
   assert.equal(job.items[1].errorCategory, 'otp');
   assert.equal(job.items[2].errorCategory, 'proxy');
+});
+
+test('mail risk control retries once on another proxy', async () => {
+  const otpProxies = [];
+  const manager = createBatchManager({
+    waitForOTP: async (_email, _password, options) => {
+      otpProxies.push(options.proxy);
+      if (options.proxy.includes(':8080')) {
+        throw new Error('mail_sms_locked: mail.com 账户协助/风控页(需人工)');
+      }
+      return '123456';
+    },
+    getAccessToken: async (token) => ({ accessToken: `access-${token}`, sessionJson: JSON.stringify({ token }) }),
+    login: async (account, options) => {
+      await options.getOtp();
+      return { sessionToken: `session-${account.email}` };
+    },
+  });
+
+  const created = manager.create({
+    concurrency: 1,
+    proxies: 'http://u:p@proxy.example:8080\nhttp://u:p@proxy.example:8081',
+    input: 'a@example.com:mail1',
+  });
+  const job = await waitForDone(manager, created.job.id);
+  assert.equal(job.items[0].status, 'success');
+  assert.deepEqual(otpProxies, [
+    'http://u:p@proxy.example:8080',
+    'http://u:p@proxy.example:8081',
+  ]);
+  assert.equal(job.items[0].errorCategory, '');
 });
 
 test('cancelled accounts keep credentials and can be retried', async () => {

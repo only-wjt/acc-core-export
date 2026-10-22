@@ -52,7 +52,8 @@ const errorCategories = {
   otp: { label: '验证码', advice: '多为邮箱密码有误或取码超时，请检查邮箱可用性' },
   risk: { label: '风控', advice: '建议降低并发并稍后重试' },
   proxy: { label: '代理/网络', advice: '建议更换代理池后重试' },
-  session: { label: 'Session', advice: '登录已通过但换取 Session 失败，可直接重试' },
+  session: { label: 'Session', advice: 'Session 无效时会自动用邮箱重新登录；若仍失败请换代理后重试' },
+  ineligible: { label: '不可设密', advice: 'OpenAI 拒绝给该号设置密码，重试通常无效' },
   unknown: { label: '未知', advice: '可先重试，若持续失败请检查代理与账号' },
 };
 
@@ -170,7 +171,10 @@ const JOB_OWNER_KEY = 'acc-core:lastJobOwner';
 function dropForeignJob(username) {
   let owner = '';
   try { owner = sessionStorage.getItem(JOB_OWNER_KEY) || ''; } catch { return; }
-  if (owner && owner !== username) forgetJob();
+  if (owner && owner !== username) {
+    forgetJob();
+    forgetPwJob();
+  }
   try { sessionStorage.setItem(JOB_OWNER_KEY, username); } catch { /* ignore */ }
 }
 
@@ -453,7 +457,10 @@ async function retryAccounts(payload, toastMessage) {
   try {
     const job = await request(`/api/jobs/${currentJobId}/retry`, {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ...payload,
+        ...adminConcurrency(concurrency),
+      }),
     });
     setJobRunning(true);
     renderJob(job);
@@ -650,10 +657,10 @@ statusBody.addEventListener('click', async (event) => {
   await retryAccounts({ index }, '正在重试该账号');
 });
 
-document.querySelectorAll('.filter-tab').forEach((button) => {
+document.querySelectorAll('#panel-session .filter-tab[data-filter]').forEach((button) => {
   button.addEventListener('click', () => {
     statusFilter = button.dataset.filter;
-    document.querySelectorAll('.filter-tab').forEach((tab) => tab.classList.toggle('is-active', tab === button));
+    document.querySelectorAll('#panel-session .filter-tab[data-filter]').forEach((tab) => tab.classList.toggle('is-active', tab === button));
     if (lastJob) renderJob(lastJob);
   });
 });
@@ -733,6 +740,7 @@ function bindFileImport(buttonId, fileId, textareaId, successMessage) {
 bindFileImport('#importAccounts', '#accountsFile', '#accounts', '已导入账号文件');
 bindFileImport('#importProxies', '#proxiesFile', '#proxies', '已导入代理文件');
 bindFileImport('#importCheck', '#checkFile', '#checkInput', '已导入 Token 文件');
+bindFileImport('#importPwAccounts', '#pwAccountsFile', '#pwAccounts', '已导入账号文件');
 
 let currentUser = null;
 
@@ -771,7 +779,7 @@ function applyTabVisibility(user) {
   if (!user || !active || active.hidden || !canUsePanel(active.dataset.panel)) showPanel('session');
 }
 
-const concurrencyInputs = [concurrency, document.querySelector('#checkConcurrency')];
+const concurrencyInputs = [concurrency, document.querySelector('#checkConcurrency'), document.querySelector('#pwConcurrency')];
 
 // 普通用户的并发数由管理员在「用户」页分配：输入框既看不到也点不动，更不会被提交
 function applyConcurrencyQuota(user) {
@@ -874,7 +882,7 @@ async function loadHistory() {
     } else {
       historyBody.innerHTML = items.map((item) => `
       <tr>
-        <td>${escapeHtml(item.kind === 'check' ? '验活' : '取 Session')}</td>
+        <td>${escapeHtml(item.kind === 'check' ? '验活' : item.kind === 'password' ? '添加密码' : '取 Session')}</td>
         <td>${escapeHtml(item.owner || '—')}</td>
         <td class="nowrap-cell" title="${escapeHtml(item.finishedAt ? new Date(item.finishedAt).toLocaleString('zh-CN', { hour12: false }) : '')}">${escapeHtml(formatWhen(item.finishedAt))}</td>
         <td>${formatResultTags(item)}${item.status === 'cancelled' ? ' <span class="status-pill status-cancelled">已取消</span>' : ''}</td>
@@ -913,7 +921,7 @@ async function showHistoryDetail(file) {
     const detail = await request(`/api/history/${encodeURIComponent(file)}`);
     const when = detail.finishedAt ? new Date(detail.finishedAt).toLocaleString('zh-CN', { hour12: false }) : '';
     document.querySelector('#historyDetailTitle').textContent =
-      `${detail.kind === 'check' ? '验活' : '取 Session'} · ${detail.owner || '—'}${when ? ` · ${when}` : ''}`;
+      `${detail.kind === 'check' ? '验活' : detail.kind === 'password' ? '添加密码' : '取 Session'} · ${detail.owner || '—'}${when ? ` · ${when}` : ''}`;
     historyDetailState.items = detail.items || [];
     historyDetailState.sessions = detail.sessions || [];
     historyDetailState.q = '';
@@ -1304,6 +1312,7 @@ async function bootAuth() {
       applyUser({ username: 'local', role: 'admin' });
       dropForeignJob('local');
       void restoreJob();
+      void restorePwJob();
       void loadHistory();
       void loadSettings();
       return;
@@ -1317,6 +1326,7 @@ async function bootAuth() {
     logoutButton.hidden = false;
     dropForeignJob(status.user.username);
     void restoreJob();
+    void restorePwJob();
     void loadHistory();
     if (status.user?.role === 'admin') {
       void loadUsers();
@@ -1330,6 +1340,7 @@ async function bootAuth() {
 document.querySelector('#logoutButton').addEventListener('click', async () => {
   try { await request('/api/auth/logout', { method: 'POST', body: '{}' }); } catch { /* ignore */ }
   forgetJob();
+  forgetPwJob();
   goToLogin();
 });
 
@@ -1681,7 +1692,12 @@ function renderCheckJob(job) {
             : (item.alive ? '有效' : '失效')
         }</span></td>
         <td>${escapeHtml((item.plan || '—').toUpperCase())}</td>
-        <td class="error-cell">${escapeHtml(checkReasonLabels[item.reason] || item.error || item.reason || '—')}</td>
+        <td class="error-cell">${escapeHtml((() => {
+          const label = checkReasonLabels[item.reason] || item.reason || '';
+          if (item.alive || !item.error) return label || '—';
+          if (!label || label === item.error) return item.error;
+          return `${label}：${item.error}`;
+        })())}</td>
         <td>${item.canRetry ? `<button class="retry-button" type="button" data-check-retry="${item.index}">重试</button>` : '—'}</td>
       </tr>`;
     }).join('')
@@ -1751,7 +1767,7 @@ document.querySelector('#checkCancel').addEventListener('click', async () => {
 document.querySelector('#checkRetryFailed').addEventListener('click', async () => {
   if (!checkJobId) return;
   try {
-    const job = await request(`/api/checks/${checkJobId}/retry`, { method: 'POST', body: JSON.stringify({ failed: true }) });
+    const job = await request(`/api/checks/${checkJobId}/retry`, { method: 'POST', body: JSON.stringify({ failed: true, ...adminConcurrency(document.querySelector('#checkConcurrency')) }) });
     document.querySelector('#checkStart').disabled = true;
     document.querySelector('#checkCancel').disabled = false;
     renderCheckJob(job);
@@ -1773,7 +1789,7 @@ checkRetrySelected.addEventListener('click', async () => {
   for (const index of indexes) selectedCheckIndexes.delete(index);
   checkRetrySelected.disabled = true;
   try {
-    const job = await request(`/api/checks/${checkJobId}/retry`, { method: 'POST', body: JSON.stringify({ indexes }) });
+    const job = await request(`/api/checks/${checkJobId}/retry`, { method: 'POST', body: JSON.stringify({ indexes, ...adminConcurrency(document.querySelector('#checkConcurrency')) }) });
     document.querySelector('#checkStart').disabled = true;
     document.querySelector('#checkCancel').disabled = false;
     renderCheckJob(job);
@@ -1813,7 +1829,7 @@ document.querySelector('#checkBody').addEventListener('click', async (event) => 
   try {
     const job = await request(`/api/checks/${checkJobId}/retry`, {
       method: 'POST',
-      body: JSON.stringify({ index: Number(button.dataset.checkRetry) }),
+      body: JSON.stringify({ index: Number(button.dataset.checkRetry), ...adminConcurrency(document.querySelector('#checkConcurrency')) }),
     });
     document.querySelector('#checkStart').disabled = true;
     renderCheckJob(job);
@@ -1822,6 +1838,413 @@ document.querySelector('#checkBody').addEventListener('click', async (event) => 
     showToast(error.message);
   }
 });
+
+const PW_STORAGE_KEY = 'acc-core:lastPasswordJobId';
+const pwAccounts = document.querySelector('#pwAccounts');
+const pwStart = document.querySelector('#pwStart');
+const pwCancel = document.querySelector('#pwCancel');
+const pwBody = document.querySelector('#pwBody');
+const pwResultList = document.querySelector('#pwResultList');
+let pwJobId = null;
+let pwPollTimer = null;
+let lastPwJob = null;
+let pwRunning = false;
+let pwFilter = 'all';
+let pwInputVisible = false;
+const selectedPwIndexes = new Set();
+
+function extractPwSession(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  if (text.startsWith('{')) {
+    try {
+      const json = JSON.parse(text);
+      return String(json.sessionToken || json.session_token || json.session || '').trim();
+    } catch {
+      return '';
+    }
+  }
+  return text;
+}
+
+function localParseMailAccounts(value) {
+  const rows = value.split(/\r?\n/).map((line, index) => ({ raw: line.trim(), line: index + 1 })).filter((row) => row.raw);
+  const errors = [];
+  let valid = 0;
+  const seen = new Set();
+
+  for (const row of rows) {
+    let email = '';
+    let mailPassword = '';
+
+    if (!row.raw.includes('----') && row.raw.includes('@') && row.raw.includes(':')) {
+      const index = row.raw.indexOf(':');
+      email = row.raw.slice(0, index).trim();
+      mailPassword = row.raw.slice(index + 1).trim();
+    } else if (row.raw.includes('----')) {
+      const parts = row.raw.split('----').map((part) => part.trim()).filter(Boolean);
+      if (parts.length >= 1 && parts[0].includes('@') && parts[0].includes(':')) {
+        email = parts[0].slice(0, parts[0].indexOf(':')).trim();
+        mailPassword = parts[0].slice(parts[0].indexOf(':') + 1).trim();
+      } else if (parts.length >= 2) {
+        email = parts[0];
+        mailPassword = parts[1];
+      }
+    } else {
+      errors.push(`第 ${row.line} 行格式应为 邮箱:邮箱密码 或 邮箱----邮箱密码`);
+      continue;
+    }
+
+    if (!email || !mailPassword) {
+      errors.push(`第 ${row.line} 行格式应为 邮箱:邮箱密码 或 邮箱----邮箱密码`);
+      continue;
+    }
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      errors.push(`第 ${row.line} 行邮箱无效`);
+      continue;
+    }
+    if (seen.has(email.toLowerCase())) {
+      errors.push(`第 ${row.line} 行邮箱重复`);
+      continue;
+    }
+    seen.add(email.toLowerCase());
+    valid += 1;
+  }
+
+  if (valid > 100) errors.push('单次最多处理 100 个账号');
+  return { valid, errors };
+}
+
+function updatePwParseState() {
+  if (!pwAccounts || !pwStart) return;
+  const parsed = localParseMailAccounts(pwAccounts.value);
+  const shared = document.querySelector('#pwBatchNew')?.value.trim() || '';
+  if (shared && shared.length < 8) parsed.errors.push('统一新密码至少 8 位');
+  document.querySelector('#pwParseCount').textContent = `${parsed.valid} 条有效输入`;
+  document.querySelector('#pwInputErrors').textContent = parsed.errors.slice(0, 3).join('；');
+  pwStart.disabled = pwRunning || parsed.valid === 0 || parsed.errors.length > 0;
+}
+
+function setPwRunning(running) {
+  pwRunning = running;
+  if (pwCancel) pwCancel.disabled = !running;
+  if (pwAccounts) pwAccounts.disabled = running;
+  const concurrencyInput = document.querySelector('#pwConcurrency');
+  if (concurrencyInput) concurrencyInput.disabled = running || currentUser?.role !== 'admin';
+  const shared = document.querySelector('#pwBatchNew');
+  if (shared) shared.disabled = running;
+  updatePwParseState();
+}
+
+function rememberPwJob(id) {
+  pwJobId = id;
+  try { sessionStorage.setItem(PW_STORAGE_KEY, id); } catch { /* ignore */ }
+}
+
+function forgetPwJob() {
+  pwJobId = null;
+  try { sessionStorage.removeItem(PW_STORAGE_KEY); } catch { /* ignore */ }
+}
+
+function syncPwRetrySelected() {
+  const button = document.querySelector('#pwRetrySelected');
+  if (!button) return;
+  const count = selectedPwIndexes.size;
+  button.disabled = count === 0;
+  button.textContent = count ? `重试所选（${count}）` : '重试所选';
+}
+
+function parsePwResultLine(line) {
+  const parts = String(line || '').split('----');
+  return {
+    email: parts[0] || '',
+    gptPassword: parts[1] || '',
+    mailPassword: parts.slice(2).join('----') || '',
+  };
+}
+
+function renderPwJob(job) {
+  lastPwJob = job;
+  document.querySelector('#pwTotal').textContent = job.counts.total;
+  document.querySelector('#pwRunning').textContent = job.counts.running;
+  document.querySelector('#pwSuccess').textContent = job.counts.success;
+  document.querySelector('#pwFailed').textContent = job.counts.failed;
+
+  const visibleItems = pwFilter === 'failed'
+    ? job.items.filter((item) => item.status === 'failed' || item.status === 'cancelled')
+    : job.items;
+  pwBody.innerHTML = visibleItems.length
+    ? visibleItems.map((item) => {
+      const retryLabel = item.retryCount ? ` · 已重试 ${item.retryCount} 次` : '';
+      const errorText = item.error ? `${item.error}${retryLabel}` : (retryLabel ? retryLabel.slice(3) : '—');
+      const category = item.status === 'failed' && item.errorCategory ? errorCategories[item.errorCategory] : null;
+      const categoryTag = category
+        ? `<span class="reason-tag reason-${item.errorCategory}" title="${escapeHtml(category.advice)}">${escapeHtml(category.label)}</span>`
+        : '';
+      const retryDisabled = !item.canRetry || item.status === 'running' || item.status === 'pending';
+      if (!item.canRetry) selectedPwIndexes.delete(item.index);
+      let actionHtml = '—';
+      if (item.status === 'running') {
+        actionHtml = `<button class="retry-button abort-button" type="button" data-pw-abort="${item.index}" ${item.aborting ? 'disabled' : ''}>${item.aborting ? '终止中' : '终止'}</button>`;
+      } else if (item.canRetry || item.status === 'failed') {
+        actionHtml = `<button class="retry-button" type="button" data-pw-retry="${item.index}" ${retryDisabled ? 'disabled' : ''}>重试</button>`;
+      }
+      return `
+      <tr>
+        <td class="select-col">${item.canRetry
+          ? `<input type="checkbox" data-pw-select="${item.index}" ${selectedPwIndexes.has(item.index) ? 'checked' : ''} aria-label="选择 ${escapeHtml(item.email)}">`
+          : ''}</td>
+        <td>${escapeHtml(item.email)}</td>
+        <td>${escapeHtml(item.stage || '—')}</td>
+        <td><span class="status-pill status-${item.status}">${statusLabels[item.status] || item.status}</span></td>
+        <td>${formatDuration(item.durationMs)}</td>
+        <td class="error-cell" title="${escapeHtml(item.error || '')}">${categoryTag}${escapeHtml(errorText)}</td>
+        <td class="action-cell">${actionHtml}</td>
+      </tr>`;
+    }).join('')
+    : `<tr class="empty-row"><td colspan="7">${pwFilter === 'failed' ? '当前没有失败或已取消的账号。' : '开始任务后，这里会逐项显示进度。'}</td></tr>`;
+
+  document.querySelector('#pwCopyFailed').disabled = !job.items.some((item) => item.status === 'failed');
+  document.querySelector('#pwRetryFailed').disabled = !job.items.some((item) => item.canRetry && (item.status === 'failed' || item.status === 'cancelled'));
+  syncPwRetrySelected();
+  syncHeaderCheckbox(document.querySelector('#selectAllPw'), selectedPwIndexes, visibleItems);
+
+  const successful = job.items.filter((item) => item.status === 'success' && item.resultLine).sort((a, b) => a.index - b.index);
+  pwResultList.innerHTML = successful.length
+    ? successful.map((item, index) => `
+      <article class="session-item">
+        <header class="session-head">
+          <div class="session-meta"><span>#${index + 1}</span><strong>${escapeHtml(item.email)}</strong></div>
+        </header>
+        <code class="session-token">${escapeHtml(item.resultLine)}</code>
+      </article>`)
+      .join('')
+    : '<p class="session-empty">成功添加的账号会按 邮箱----GPT密码----邮箱密码 显示在这里。</p>';
+  const hasResults = (job.results || []).length > 0;
+  document.querySelector('#pwCopyResults').disabled = !hasResults;
+  document.querySelector('#pwDownloadResults').disabled = !hasResults;
+  document.querySelector('#pwExportExcel').disabled = !hasResults;
+}
+
+async function pollPwJob() {
+  pwPollTimer = null;
+  if (!pwJobId) return;
+  try {
+    const job = await request(`/api/passwords/${pwJobId}`);
+    renderPwJob(job);
+    if (job.status === 'running') {
+      setPwRunning(true);
+      pwPollTimer = setTimeout(pollPwJob, 800);
+    } else {
+      setPwRunning(false);
+      showToast(`添加密码完成：成功 ${job.counts.success}，失败 ${job.counts.failed}`);
+      void loadHistory();
+    }
+  } catch (error) {
+    setPwRunning(false);
+    showToast(error.message);
+  }
+}
+
+async function retryPwAccounts(payload, toastMessage) {
+  if (!pwJobId) return;
+  try {
+    const job = await request(`/api/passwords/${pwJobId}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...adminConcurrency(document.querySelector('#pwConcurrency')) }),
+    });
+    setPwRunning(true);
+    if (pwCancel) pwCancel.disabled = false;
+    renderPwJob(job);
+    if (!pwPollTimer) pwPollTimer = setTimeout(pollPwJob, 400);
+    if (toastMessage) showToast(toastMessage);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+pwAccounts?.addEventListener('input', updatePwParseState);
+document.querySelector('#pwBatchNew')?.addEventListener('input', updatePwParseState);
+document.querySelector('#togglePwSecrets')?.addEventListener('click', () => {
+  pwInputVisible = !pwInputVisible;
+  pwAccounts.classList.toggle('is-masked', !pwInputVisible);
+  const button = document.querySelector('#togglePwSecrets');
+  button.title = pwInputVisible ? '隐藏输入内容' : '显示输入内容';
+  button.setAttribute('aria-label', button.title);
+});
+pwAccounts?.classList.add('is-masked');
+updatePwParseState();
+
+pwStart?.addEventListener('click', async () => {
+  selectedPwIndexes.clear();
+  setPwRunning(true);
+  try {
+    const job = await request('/api/passwords', {
+      method: 'POST',
+      body: JSON.stringify({
+        input: pwAccounts.value,
+        newPassword: document.querySelector('#pwBatchNew').value.trim(),
+        ...adminConcurrency(document.querySelector('#pwConcurrency')),
+      }),
+    });
+    rememberPwJob(job.id);
+    renderPwJob(job);
+    pwPollTimer = setTimeout(pollPwJob, 400);
+  } catch (error) {
+    setPwRunning(false);
+    showToast(error.message);
+  }
+});
+
+pwCancel?.addEventListener('click', async () => {
+  if (!pwJobId) return;
+  try {
+    const job = await request(`/api/passwords/${pwJobId}/cancel`, { method: 'POST', body: '{}' });
+    renderPwJob(job);
+    showToast('已发送取消请求');
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+document.querySelector('#pwCopyFailed')?.addEventListener('click', async () => {
+  const emails = (lastPwJob?.items || []).filter((item) => item.status === 'failed').map((item) => item.email);
+  if (!emails.length) return;
+  await copyText(emails.join('\n'), `已复制 ${emails.length} 个失败邮箱`);
+});
+
+document.querySelector('#pwRetryFailed')?.addEventListener('click', async () => {
+  await retryPwAccounts({ failed: true }, '正在重试失败账号');
+});
+
+document.querySelector('#pwRetrySelected')?.addEventListener('click', async () => {
+  const indexes = [...selectedPwIndexes]
+    .filter((index) => lastPwJob?.items.find((item) => item.index === index)?.canRetry)
+    .sort((a, b) => a - b);
+  if (!indexes.length) {
+    showToast('请先勾选要重试的账号');
+    return;
+  }
+  for (const index of indexes) selectedPwIndexes.delete(index);
+  await retryPwAccounts({ indexes }, `正在重试 ${indexes.length} 个所选账号`);
+});
+
+document.querySelector('#selectAllPw')?.addEventListener('change', () => {
+  const header = document.querySelector('#selectAllPw');
+  const boxes = pwBody.querySelectorAll('[data-pw-select]');
+  for (const box of boxes) {
+    box.checked = header.checked;
+    const index = Number(box.dataset.pwSelect);
+    if (header.checked) selectedPwIndexes.add(index);
+    else selectedPwIndexes.delete(index);
+  }
+  syncPwRetrySelected();
+});
+
+pwBody?.addEventListener('change', (event) => {
+  const box = event.target.closest('[data-pw-select]');
+  if (!box) return;
+  const index = Number(box.dataset.pwSelect);
+  if (box.checked) selectedPwIndexes.add(index);
+  else selectedPwIndexes.delete(index);
+  syncPwRetrySelected();
+  if (lastPwJob) {
+    const visibleItems = pwFilter === 'failed'
+      ? lastPwJob.items.filter((item) => item.status === 'failed' || item.status === 'cancelled')
+      : lastPwJob.items;
+    syncHeaderCheckbox(document.querySelector('#selectAllPw'), selectedPwIndexes, visibleItems);
+  }
+});
+
+pwBody?.addEventListener('click', async (event) => {
+  if (event.target.closest('[data-pw-select]')) return;
+  const abortButton = event.target.closest('[data-pw-abort]');
+  if (abortButton && !abortButton.disabled && pwJobId) {
+    abortButton.disabled = true;
+    abortButton.textContent = '终止中';
+    try {
+      const job = await request(`/api/passwords/${pwJobId}/abort`, {
+        method: 'POST',
+        body: JSON.stringify({ index: Number(abortButton.dataset.pwAbort) }),
+      });
+      renderPwJob(job);
+      if (!pwPollTimer) pwPollTimer = setTimeout(pollPwJob, 400);
+      showToast('已发送终止请求，结束后可重试');
+    } catch (error) {
+      showToast(error.message);
+      if (lastPwJob) renderPwJob(lastPwJob);
+    }
+    return;
+  }
+  const button = event.target.closest('[data-pw-retry]');
+  if (!button || button.disabled || !pwJobId) return;
+  button.disabled = true;
+  await retryPwAccounts({ index: Number(button.dataset.pwRetry) }, '正在重试该账号');
+});
+
+document.querySelectorAll('[data-pw-filter]').forEach((button) => {
+  button.addEventListener('click', () => {
+    pwFilter = button.dataset.pwFilter;
+    document.querySelectorAll('[data-pw-filter]').forEach((tab) => tab.classList.toggle('is-active', tab === button));
+    if (lastPwJob) renderPwJob(lastPwJob);
+  });
+});
+
+document.querySelector('#pwCopyResults')?.addEventListener('click', async () => {
+  const lines = lastPwJob?.results || [];
+  if (!lines.length) return;
+  await copyText(lines.join('\n'), `已复制 ${lines.length} 条账号`);
+});
+
+document.querySelector('#pwDownloadResults')?.addEventListener('click', () => {
+  const lines = lastPwJob?.results || [];
+  if (!lines.length) return;
+  const blob = new Blob([`${lines.join('\n')}\n`], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'gpt-passwords.txt';
+  link.click();
+  URL.revokeObjectURL(url);
+});
+
+document.querySelector('#pwExportExcel')?.addEventListener('click', () => {
+  const lines = lastPwJob?.results || [];
+  if (!lines.length) return;
+  const rows = [
+    ['邮箱', 'GPT密码', '邮箱密码'],
+    ...lines.map((line) => {
+      const account = parsePwResultLine(line);
+      return [account.email, account.gptPassword, account.mailPassword];
+    }),
+  ];
+  const csv = `\uFEFF${rows.map((row) => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'gpt-passwords.csv';
+  link.click();
+  URL.revokeObjectURL(url);
+  showToast('已导出 Excel（CSV）');
+});
+
+async function restorePwJob() {
+  let id = '';
+  try { id = sessionStorage.getItem(PW_STORAGE_KEY) || ''; } catch { return; }
+  if (!id) return;
+  pwJobId = id;
+  try {
+    const job = await request(`/api/passwords/${id}`);
+    renderPwJob(job);
+    if (job.status === 'running') {
+      setPwRunning(true);
+      pwPollTimer = setTimeout(pollPwJob, 400);
+    }
+  } catch {
+    forgetPwJob();
+  }
+}
 
 function totpCodeLocal(secret, atMs = Date.now()) {
   const s = String(secret || '').toUpperCase().replace(/[\s=-]+/g, '');
@@ -1924,9 +2347,19 @@ document.querySelector('#mfaDisable').addEventListener('click', (event) => runTo
   proxy: document.querySelector('#mfaProxy').value || null,
 }));
 
+document.querySelector('#pwAddBtn').addEventListener('click', (event) => runTool(event.currentTarget, document.querySelector('#pwOutput'), '/api/password/gpt-add', {
+  email: document.querySelector('#pwEmail').value,
+  mailPassword: document.querySelector('#pwMail').value,
+  sessionToken: document.querySelector('#pwSession').value,
+  totpSecret: document.querySelector('#pwSecret').value || null,
+  newPassword: document.querySelector('#pwNew').value,
+  proxy: document.querySelector('#pwProxy').value || null,
+}));
 document.querySelector('#pwGptBtn').addEventListener('click', (event) => runTool(event.currentTarget, document.querySelector('#pwOutput'), '/api/password/gpt', {
   email: document.querySelector('#pwEmail').value,
   gptPassword: document.querySelector('#pwGpt').value,
+  mailPassword: document.querySelector('#pwMail').value,
+  sessionToken: document.querySelector('#pwSession').value || null,
   totpSecret: document.querySelector('#pwSecret').value || null,
   newPassword: document.querySelector('#pwNew').value,
   proxy: document.querySelector('#pwProxy').value || null,
