@@ -12,10 +12,8 @@ const boundedConcurrency = (value, fallback) => {
 
 export const MAX = boundedConcurrency(process.env.MAX_CONCURRENCY, 36);
 
-// mail.com 登录/检测并发 —— 随全局 MAX(默认 36)。代理网关出现 status0 时用环境变量快速降载。
-// 短信锁的真因是"频繁改密"(见 routes init 的 needsInit 门控),不是并发;并发影响的只是网关连通性。
-// 间隔默认 0(每号独立 IP 无需错峰)。env: MAIL_LOGIN_CONCURRENCY / MAIL_LOGIN_GAP_MS
 // mail.com 登录/取码并发。工作台代理池通常很少，默认压到 2 路并错开，避免 10 个号同时打同一出口。
+// 短信锁的真因是"频繁改密"(见 routes init 的 needsInit 门控),不是并发;并发影响的只是网关连通性。
 // env: MAIL_LOGIN_CONCURRENCY / MAIL_LOGIN_GAP_MS
 export const MAIL_LOGIN_CONCURRENCY = boundedConcurrency(process.env.MAIL_LOGIN_CONCURRENCY, 2);
 export const MAIL_LOGIN_GAP_MS = process.env.MAIL_LOGIN_GAP_MS !== undefined ? Number(process.env.MAIL_LOGIN_GAP_MS) : 1500;

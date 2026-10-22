@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { isSessionHandshakeError } from '../src/session-recovery.js';
 import { parseProxyPool } from './batch-session.js';
+import { isRegionBlock } from './error-classify.js';
 
 function generatePassword(length = 14) {
   const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -39,6 +40,7 @@ function publicError(error) {
 
 function classifyError(error) {
   const text = String(error?.message || error || '');
+  if (isRegionBlock(error)) return 'region';
   if (/(密码错误|密码不正确|wrong password|invalid[\s_-]*(login|password|credential)|凭据无效)/i.test(text)) return 'password';
   if (/(验证码|OTP|未取到.*码|邮件验证)/i.test(text)) return 'otp';
   if (/change_password_ineligible|不允许设置 GPT 密码|不允许走设置内改密|社交登录或企业号无法补密码/i.test(text)) return 'ineligible';

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStore } from '../server/persist.js';
@@ -43,6 +43,24 @@ test('regular users only list their own jobs', async () => {
   const admin = await store.listRecent(20, { owner: 'admin', isAdmin: true });
   assert.deepEqual(alice.map((item) => item.owner), ['alice']);
   assert.equal(admin.length, 2);
+});
+
+test('prune keeps only the newest maxFiles archives', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'acc-persist-'));
+  const store = createStore({ dir, maxFiles: 2 });
+  for (let i = 1; i <= 4; i++) {
+    await store.saveJob('session', {
+      id: `${i}0000000-0000-0000-0000-000000000000`,
+      status: 'completed',
+      finishedAt: Date.parse(`2026-08-1${i}T00:00:00Z`),
+      counts: {},
+      items: [],
+    });
+  }
+  const files = (await readdir(dir)).filter((name) => name.endsWith('.json')).sort();
+  assert.equal(files.length, 2);
+  // 保留的应是最新的两条（08-13、08-14），最旧的两条被清掉
+  assert.ok(files.every((name) => name.includes('2026-08-13') || name.includes('2026-08-14')));
 });
 
 test('saves a password job without result lines', async () => {

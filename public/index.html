@@ -508,13 +508,15 @@
         <div class="import-row">
           <button class="primary-button" id="openProxyModal" type="button">添加代理</button>
           <button class="icon-text-button" id="importProxies" type="button">导入文件</button>
+          <button class="icon-text-button" id="checkProxies" type="button">检测代理</button>
           <button class="icon-text-button" id="proxyClear" type="button">清空</button>
           <input id="proxiesFile" type="file" accept=".txt,.csv,.log" hidden>
         </div>
+        <p class="field-hint">「检测代理」会逐条查出口 IP 和国家，<strong>落在不支持地区（如香港 HK）的会标红</strong>——ChatGPT 对这些出口直接拒绝，换成受支持地区的代理即可。</p>
         <textarea id="proxies" hidden></textarea>
         <div class="table-wrap spaced">
           <table class="users-table proxy-table">
-            <thead><tr><th>代理</th><th>操作</th></tr></thead>
+            <thead><tr><th>代理</th><th>出口国家</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="proxyList"></tbody>
           </table>
         </div>

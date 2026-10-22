@@ -693,6 +693,8 @@ select { cursor: pointer; }
   white-space: nowrap;
   vertical-align: baseline;
 }
+.muted { color: var(--muted); }
+.reason-region { color: var(--stop); background: var(--stop-soft); }
 .reason-password { color: var(--stop); background: var(--stop-soft); }
 .reason-otp { color: var(--warn); background: var(--warn-soft); }
 .reason-risk { color: var(--risk); background: var(--risk-soft); }

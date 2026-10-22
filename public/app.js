@@ -48,6 +48,7 @@ const statusLabels = {
 };
 
 const errorCategories = {
+  region: { label: '地区不支持', advice: 'OpenAI 不支持该出口地区（如香港）。请把代理出口换到受支持地区，换代理重试' },
   password: { label: '密码错误', advice: '请核对账号密码后重试' },
   otp: { label: '验证码', advice: '多为邮箱密码有误或取码超时，请检查邮箱可用性' },
   risk: { label: '风控', advice: '建议降低并发并稍后重试' },
@@ -1107,6 +1108,24 @@ async function loadApiDocs() {
 const proxies = document.querySelector('#proxies');
 const proxyCount = document.querySelector('#proxyCount');
 const proxyErrors = document.querySelector('#proxyErrors');
+// 代理预检结果，按 host:port 索引（服务端回显去掉了凭据，前端行里带凭据，用 host:port 对齐）
+let proxyChecks = new Map();
+
+function proxyKey(line) {
+  try {
+    return new URL(/:\/\//.test(line) ? line : `socks5://${line}`).host.toLowerCase();
+  } catch {
+    return String(line || '').trim().toLowerCase();
+  }
+}
+
+function proxyStatusCell(check) {
+  if (!check) return '<span class="muted">未检测</span>';
+  if (!check.ok) return `<span class="reason-tag reason-proxy" title="${escapeHtml(check.error || '')}">不可用</span>`;
+  if (check.supported === false) return `<span class="reason-tag reason-region" title="OpenAI 不支持该地区，换受支持地区的代理">不支持地区</span>`;
+  if (check.supported === null) return `<span class="reason-tag reason-unknown" title="${escapeHtml(check.error || '未能识别国家')}">国家未知</span>`;
+  return '<span class="reason-tag reason-session">可用</span>';
+}
 
 function countProxyLines(text) {
   return text.split(/\r?\n/).filter((line) => line.trim() && !line.trim().startsWith('#')).length;
@@ -1131,12 +1150,17 @@ function renderProxyList() {
   const body = document.querySelector('#proxyList');
   if (!body) return;
   const lines = (proxies?.value || '').split(/\r?\n/).filter((line) => line.trim());
-  body.innerHTML = lines.map((line, index) => `
+  body.innerHTML = lines.map((line, index) => {
+    const check = proxyChecks.get(proxyKey(line));
+    return `
     <tr>
       <td><code>${escapeHtml(maskProxy(line))}</code></td>
+      <td>${check?.country ? escapeHtml(check.country) : '<span class="muted">—</span>'}</td>
+      <td>${proxyStatusCell(check)}</td>
       <td><button class="retry-button" type="button" data-remove-proxy="${index}">删除</button></td>
     </tr>
-  `).join('') || '<tr><td colspan="2">还没有代理。点「添加代理」或导入文件。</td></tr>';
+  `;
+  }).join('') || '<tr><td colspan="4">还没有代理。点「添加代理」或导入文件。</td></tr>';
   updateProxyCount();
 }
 
@@ -1163,6 +1187,7 @@ function normalizeProxyText(text) {
 function applySettings(settings) {
   if (!proxies) return;
   proxies.value = settings.proxyText || '';
+  proxyChecks = new Map();
   concurrencyLimit = settings.concurrencyLimit || concurrencyLimit;
   for (const input of [...concurrencyInputs, document.querySelector('#newUserConcurrency')]) {
     if (input) input.max = String(concurrencyLimit);
@@ -1245,7 +1270,38 @@ document.querySelector('#reloadSettings')?.addEventListener('click', () => {
 
 document.querySelector('#proxyClear')?.addEventListener('click', () => {
   setProxyText('');
+  proxyChecks = new Map();
   showToast('已清空列表，记得保存才会生效');
+});
+
+document.querySelector('#checkProxies')?.addEventListener('click', async () => {
+  const button = document.querySelector('#checkProxies');
+  if (!proxies?.value.trim()) {
+    showToast('代理池为空，先添加代理');
+    return;
+  }
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = '检测中…';
+  if (proxyErrors) proxyErrors.textContent = '';
+  try {
+    const result = await request('/api/proxy/preflight', {
+      method: 'POST',
+      body: JSON.stringify({ proxies: proxies.value }),
+    });
+    const next = new Map();
+    for (const item of result.results || []) next.set(proxyKey(item.proxy), item);
+    proxyChecks = next;
+    renderProxyList();
+    const { total = 0, unsupported = 0, dead = 0 } = result.summary || {};
+    showToast(`检测完成：${total} 条，不支持地区 ${unsupported} 条，不可用 ${dead} 条`);
+  } catch (error) {
+    if (proxyErrors) proxyErrors.textContent = error.message;
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
 });
 
 proxies?.addEventListener('input', renderProxyList);

@@ -16,6 +16,8 @@ import { createApiKeys } from './api-keys.js';
 import { createOpenApi } from './openapi.js';
 import { authorizeCodexAccount } from '../src/codex-oauth.js';
 import { getOpenApiDocs } from './openapi-spec.js';
+import { createProxyChecker } from '../src/proxy-check.js';
+import { parseProxyPool } from './batch-session.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT) || 3780;
@@ -34,6 +36,7 @@ const apiKeys = createApiKeys({
   },
   getUserRateLimit: (username) => auth.rateLimitFor(username),
 });
+const proxyChecker = createProxyChecker();
 const jobOwners = new Map();
 const manager = createBatchManager({
   login: gpt.login,
@@ -360,6 +363,37 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       json(res, 405, { error: '请求方法不支持' });
+      return;
+    }
+
+    // 代理预检：逐条查出口 IP/国家，标出落在不支持地区（如香港）的代理。
+    // 直接回答"香港代理为什么连不上 ChatGPT"——出口在 HK 的会被标为 supported:false。
+    if (req.method === 'POST' && url.pathname === '/api/proxy/preflight') {
+      if (auth.currentUser(req)?.role !== 'admin') {
+        json(res, 403, { error: '仅管理员可检测代理' });
+        return;
+      }
+      const source = typeof body?.proxies === 'string' && body.proxies.trim()
+        ? body.proxies
+        : adminSettings.get().proxyText;
+      const { proxies, errors } = parseProxyPool(source || '');
+      if (errors.length) {
+        json(res, 400, { errors });
+        return;
+      }
+      if (!proxies.length) {
+        json(res, 400, { error: '代理池为空，请先在设置里配置代理' });
+        return;
+      }
+      const results = await proxyChecker.checkProxies(proxies, { concurrency: 5 });
+      json(res, 200, {
+        results,
+        summary: {
+          total: results.length,
+          unsupported: results.filter((item) => item.supported === false).length,
+          dead: results.filter((item) => !item.ok).length,
+        },
+      });
       return;
     }
 

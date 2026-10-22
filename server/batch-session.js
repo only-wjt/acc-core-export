@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isRegionBlock } from './error-classify.js';
 
 const DEFAULT_MAX_ACCOUNTS = 100;
 const DEFAULT_RETENTION_MS = 30 * 60 * 1000;
@@ -16,6 +17,7 @@ function publicError(error) {
 // 把原始错误归类，便于操作者判断该换代理重试还是改输入。基于原文匹配后再脱敏展示。
 function classifyError(error) {
   const text = String(error?.message || error || '');
+  if (isRegionBlock(error)) return 'region';
   if (/(密码错误|密码不正确|wrong password|invalid[\s_-]*(login|password|credential)|凭据无效)/i.test(text)) return 'password';
   if (/(验证码|OTP|未取到.*码|邮件验证)/i.test(text)) return 'otp';
   if (/(429|rate[\s_-]*limit|too many|风控|频率|blocked|封禁|challenge|cloudflare|人机验证|访问被拒|mail_sms_locked|sms_locked|协助)/i.test(text)) return 'risk';
