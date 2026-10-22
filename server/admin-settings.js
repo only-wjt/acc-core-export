@@ -14,6 +14,16 @@ function boundedInt(value, fallback, min, max) {
 
 const DEFAULT_MAX_API_KEYS = boundedInt(process.env.OPENAPI_MAX_KEYS, 3, 1, 20);
 const DEFAULT_API_RATE_LIMIT = boundedInt(process.env.OPENAPI_RATE_LIMIT, 60, 1, 6000);
+const DEFAULT_SUB2_ROOT = process.env.TOSUB2_ROOT || '';
+const DEFAULT_SUB2_PORT = boundedInt(process.env.TOSUB2_PORT, 4399, 1024, 65535);
+
+// 设置页来的值可能是 true / 'true' / 1，统一收敛成布尔；认不出来的按原样丢弃。
+function toBool(value) {
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || value === '1' || value === 'true') return true;
+  if (value === 0 || value === '0' || value === 'false') return false;
+  return undefined;
+}
 
 function settingsPath() {
   if (process.env.SETTINGS_FILE) return resolve(process.env.SETTINGS_FILE);
@@ -26,6 +36,10 @@ export function createAdminSettings({ file = settingsPath() } = {}) {
     proxies: [],
     maxApiKeys: DEFAULT_MAX_API_KEYS,
     apiRateLimit: DEFAULT_API_RATE_LIMIT,
+    // toSub2 是外部开源工具，默认关闭：没装的人不该被一个必报错的开关打扰。
+    sub2Enabled: false,
+    sub2Root: DEFAULT_SUB2_ROOT,
+    sub2Port: DEFAULT_SUB2_PORT,
   };
 
   try {
@@ -34,6 +48,9 @@ export function createAdminSettings({ file = settingsPath() } = {}) {
       proxies: Array.isArray(parsed.proxies) ? parsed.proxies.filter((item) => typeof item === 'string') : [],
       maxApiKeys: boundedInt(parsed.maxApiKeys, DEFAULT_MAX_API_KEYS, 1, 20),
       apiRateLimit: boundedInt(parsed.apiRateLimit, DEFAULT_API_RATE_LIMIT, 1, 6000),
+      sub2Enabled: toBool(parsed.sub2Enabled) ?? false,
+      sub2Root: typeof parsed.sub2Root === 'string' ? parsed.sub2Root : DEFAULT_SUB2_ROOT,
+      sub2Port: boundedInt(parsed.sub2Port, DEFAULT_SUB2_PORT, 1024, 65535),
     };
   } catch {
     /* 没有配置文件就用默认值 */
@@ -57,11 +74,14 @@ export function createAdminSettings({ file = settingsPath() } = {}) {
       concurrencyLimit: CONCURRENCY_LIMIT,
       maxApiKeys: state.maxApiKeys,
       apiRateLimit: state.apiRateLimit,
+      sub2Enabled: state.sub2Enabled,
+      sub2Root: state.sub2Root,
+      sub2Port: state.sub2Port,
       file,
     };
   }
 
-  function update({ proxies, maxApiKeys, apiRateLimit } = {}) {
+  function update({ proxies, maxApiKeys, apiRateLimit, sub2Enabled, sub2Root, sub2Port } = {}) {
     const errors = [];
     const notes = [];
     const next = { ...state };
@@ -86,6 +106,24 @@ export function createAdminSettings({ file = settingsPath() } = {}) {
       const value = boundedInt(apiRateLimit, NaN, 1, 6000);
       if (!Number.isInteger(value)) errors.push({ message: '每名用户最大请求次数必须是 1 到 6000 的整数' });
       else next.apiRateLimit = value;
+    }
+
+    if (sub2Enabled !== undefined) {
+      const value = toBool(sub2Enabled);
+      if (value === undefined) errors.push({ message: 'toSub2 开关必须是布尔值' });
+      else next.sub2Enabled = value;
+    }
+
+    if (sub2Root !== undefined) {
+      // 空串表示「还没配」，不当作错误：默认就是关着的，配了路径再打开开关。
+      if (typeof sub2Root !== 'string') errors.push({ message: 'toSub2 目录必须是字符串' });
+      else next.sub2Root = sub2Root.trim();
+    }
+
+    if (sub2Port !== undefined) {
+      if (!Number.isInteger(Number(sub2Port)) || Number(sub2Port) < 1024 || Number(sub2Port) > 65535) {
+        errors.push({ message: 'toSub2 端口必须是 1024 到 65535 的整数' });
+      } else next.sub2Port = Number(sub2Port);
     }
 
     if (errors.length) return { ok: false, errors };

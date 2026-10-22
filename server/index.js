@@ -20,6 +20,7 @@ import { createProxyChecker } from '../src/proxy-check.js';
 import { parseProxyPool } from './batch-session.js';
 import { createLogger, summarizeJob } from './logger.js';
 import { createRuntimeKeeper } from './runtime-snapshot.js';
+import { createSub2Sidecar } from './sub2api-sidecar.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT) || 3780;
@@ -78,6 +79,20 @@ const openApi = createOpenApi({
   gpt,
   mail,
   authorizeCodex: authorizeCodexAccount,
+});
+
+// toSub2 作为一个受管子进程托管：配置走 adminSettings 回调，管理员在设置页改完立即生效，
+// 不需要重启本进程。见 server/sub2api-sidecar.js
+const sub2 = createSub2Sidecar({
+  logger,
+  getConfig: () => {
+    const settings = adminSettings.get();
+    return {
+      enabled: settings.sub2Enabled,
+      rootDir: settings.sub2Root,
+      port: settings.sub2Port,
+    };
+  },
 });
 
 // 运行中任务快照与重启恢复，见 server/runtime-snapshot.js
@@ -540,6 +555,44 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // toSub2 的接口一律管理员专属：token 能直接驱动那个进程跑账号任务，普通用户不能碰。
+    if (url.pathname === '/api/sub2' || url.pathname.startsWith('/api/sub2/')) {
+      if (auth.currentUser(req)?.role !== 'admin') {
+        json(res, 403, { error: '仅管理员可使用 toSub2' });
+        return;
+      }
+      // console token 只在服务端用于代发请求，绝不下发浏览器——拿到它就能直接操纵子进程。
+      const publicState = ({ token, ...rest }) => rest;
+      if (req.method === 'GET' && url.pathname === '/api/sub2/status') {
+        json(res, 200, publicState(sub2.status()));
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/sub2/start') {
+        const state = await sub2.start();
+        json(res, state.error ? 502 : 200, publicState(state));
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/sub2/stop') {
+        await sub2.stop();
+        json(res, 200, publicState(sub2.status()));
+        return;
+      }
+      // /api/sub2/api/jobs => toSub2 的 /api/jobs；只透传 JSON 接口，不碰它的 SPA
+      if (url.pathname.startsWith('/api/sub2/api/') && (req.method === 'GET' || req.method === 'POST')) {
+        const subPath = url.pathname.slice('/api/sub2/api/'.length) + url.search;
+        try {
+          await sub2.ensureReady();
+        } catch (error) {
+          json(res, 503, { error: publicError(error) });
+          return;
+        }
+        await sub2.proxy(req, res, subPath, req.method === 'POST' ? body : undefined);
+        return;
+      }
+      json(res, 404, { error: '接口不存在' });
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/history') {
       const user = auth.currentUser(req);
       const kind = url.searchParams.get('kind') || '';
@@ -712,6 +765,8 @@ async function close() {
   if (closing) return;
   closing = true;
   runtimeKeeper.stop();
+  // 子进程不跟着父进程走：不显式停掉，它会一直占着端口变成孤儿。
+  await sub2.stop().catch(() => {});
   // 退出前再存一次，尽量留住正在跑的进度
   await runtimeKeeper.snapshotRunning().catch(() => {});
   server.close();

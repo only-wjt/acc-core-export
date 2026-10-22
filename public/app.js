@@ -1,3 +1,7 @@
+import { escapeHtml, formatDuration, formatWhen, csvCell, formatResultTags, parseAccountDisplay, maskProxy, normalizeProxyText, countProxyLines, formatSubscription } from './lib/text.js';
+import { statusLabels, errorCategories } from './lib/labels.js';
+import { request } from './lib/http.js';
+
 const accounts = document.querySelector('#accounts');
 const concurrency = document.querySelector('#concurrency');
 const parseCount = document.querySelector('#parseCount');
@@ -38,27 +42,6 @@ let pollTimer = null;
 let toastTimer = null;
 let inputVisible = false;
 const selectedAccountIndexes = new Set();
-
-const statusLabels = {
-  pending: '等待',
-  running: '处理中',
-  success: '成功',
-  failed: '失败',
-  cancelled: '已取消',
-  interrupted: '已中断',
-};
-
-const errorCategories = {
-  region: { label: '地区不支持', advice: 'OpenAI 不支持该出口地区（如香港）。请把代理出口换到受支持地区，换代理重试' },
-  password: { label: '密码错误', advice: '请核对账号密码后重试' },
-  otp: { label: '验证码', advice: '多为邮箱密码有误或取码超时，请检查邮箱可用性' },
-  risk: { label: '风控', advice: '建议降低并发并稍后重试' },
-  proxy: { label: '代理/网络', advice: '建议更换代理池后重试' },
-  session: { label: 'Session', advice: 'Session 无效时会自动用邮箱重新登录；若仍失败请换代理后重试' },
-  ineligible: { label: '不可设密', advice: 'OpenAI 拒绝给该号设置密码，重试通常无效' },
-  interrupted: { label: '已中断', advice: '服务重启导致任务中断，请重新发起这些账号' },
-  unknown: { label: '未知', advice: '可先重试，若持续失败请检查代理与账号' },
-};
 
 function showToast(message) {
   clearTimeout(toastTimer);
@@ -191,25 +174,6 @@ function forgetJob() {
   try { sessionStorage.removeItem(JOB_STORAGE_KEY); } catch { /* ignore */ }
 }
 
-function parseAccountDisplay(item) {
-  const raw = item.accountDisplay || '';
-  if (raw.includes('----')) {
-    const [email, gptPassword = '', mailPassword = ''] = raw.split('----');
-    return { email: email || item.email, gptPassword, mailPassword };
-  }
-  const separator = raw.indexOf(':');
-  if (separator > 0) {
-    return { email: raw.slice(0, separator) || item.email, gptPassword: '', mailPassword: raw.slice(separator + 1) };
-  }
-  return { email: item.email, gptPassword: '', mailPassword: '' };
-}
-
-function csvCell(value) {
-  const text = String(value ?? '');
-  if (/[",\r\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
-  return text;
-}
-
 function sessionByIndex(job) {
   const map = new Map();
   job.items
@@ -236,71 +200,6 @@ function updateRateHint(job) {
   const advice = top ? errorCategories[top[0]]?.advice : '建议降低并发或更换代理后重试';
   rateHint.hidden = false;
   rateHint.textContent = `失败较多（${job.counts.failed}/${finished}）。${advice}。`;
-}
-
-function formatDuration(ms) {
-  if (!ms) return '—';
-  if (ms < 1000) return `${ms} ms`;
-  return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
-}
-
-function escapeHtml(value) {
-  return String(value || '').replace(/[&<>'"]/g, (char) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
-  })[char]);
-}
-
-function formatSubscription(info) {
-  if (!info || (!info.plan && !info.cancelRenewal && !info.warnings?.length)) {
-    return '';
-  }
-  const missing = info.billingApplicable === false ? '免费账号无此项' : '未提供';
-  const date = (value) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : missing;
-  const remaining = info.remainingMs == null ? missing : `${Math.floor(info.remainingMs / 86400000)} 天 ${Math.floor((info.remainingMs % 86400000) / 3600000)} 小时`;
-  const amount = info.lastPaymentAmount == null ? missing : `${info.currency || ''} ${(info.lastPaymentAmount / 100).toFixed(2)}`.trim();
-  const method = info.paymentMethod
-    ? `${info.paymentMethod.brand || 'CARD'} **** ${info.paymentMethod.last4}${info.paymentMethod.expMonth ? ` · ${String(info.paymentMethod.expMonth).padStart(2, '0')}/${info.paymentMethod.expYear}` : ''}`
-    : missing;
-  let invoiceHost = '';
-  if (info.invoiceUrl) {
-    try {
-      const invoiceUrl = new URL(info.invoiceUrl);
-      if (invoiceUrl.protocol === 'https:' && invoiceUrl.hostname === 'invoice.stripe.com') invoiceHost = invoiceUrl.href;
-    } catch {}
-  }
-  const periodLabel = info.billingPeriod === 'year' || info.billingPeriod === 'yearly' ? '年付'
-    : info.billingPeriod === 'month' || info.billingPeriod === 'monthly' ? '月付'
-      : info.billingPeriod || missing;
-  const cancel = info.cancelRenewal;
-  let cancelLabel = '未执行';
-  if (cancel?.ok && cancel.skipped) cancelLabel = cancel.message || '已跳过';
-  else if (cancel?.ok && cancel.optimistic) cancelLabel = '已发送取消请求（验证跳过）';
-  else if (cancel?.ok && cancel.willRenew !== true) cancelLabel = cancel.activeUntil
-    ? `已取消，权益保留至 ${new Date(cancel.activeUntil).toLocaleString('zh-CN', { hour12: false })}`
-    : '已取消，到期后不续费';
-  else if (cancel?.ok === false) cancelLabel = cancel.error || '取消失败';
-  else if (info.autoRenew === false) cancelLabel = '到期后不续费';
-  return `
-    <div class="subscription-grid">
-      <span>当前套餐</span><strong>${escapeHtml(String(info.plan || '未知').toUpperCase())}</strong>
-      <span>订阅状态</span><strong>${info.active ? '有效' : escapeHtml(info.status || '未知')}</strong>
-      <span>开始时间</span><strong>${escapeHtml(date(info.periodStart))}</strong>
-      <span>到期时间</span><strong>${escapeHtml(date(info.periodEnd))}</strong>
-      <span>剩余</span><strong>${escapeHtml(remaining)}</strong>
-      <span>自动续费</span><strong>${info.autoRenew == null ? missing : info.autoRenew ? '已开启' : '到期后不续费'}</strong>
-      <span>取消续费</span><strong>${escapeHtml(cancelLabel)}</strong>
-      <span>计费周期</span><strong>${escapeHtml(periodLabel)}</strong>
-      <span>最近付款</span><strong>${escapeHtml(amount)}${info.lastPaymentAt ? ` · ${escapeHtml(date(info.lastPaymentAt))}` : ''}</strong>
-      <span>历史付费</span><strong>${info.previouslyPaid == null ? '未提供' : info.previouslyPaid ? '曾付费' : '从未付费'}</strong>
-      <span>支付方式</span><strong>${escapeHtml(method)}</strong>
-      <span>账号地区</span><strong>${escapeHtml([info.profile?.country, info.profile?.region].filter(Boolean).join(' / ') || '未提供')}</strong>
-      <span>创建时间</span><strong>${escapeHtml(info.profile?.createdAt ? new Date(info.profile.createdAt).toLocaleString('zh-CN', { hour12: false }) : '未提供')}</strong>
-      <span>MFA</span><strong>${info.profile?.mfaEnabled == null ? '未提供' : info.profile.mfaEnabled ? '已启用' : '未启用'}</strong>
-      <span>邮箱类型</span><strong>${escapeHtml(info.profile?.emailDomainType || '未提供')}</strong>
-      <span>账单发票</span><strong>${invoiceHost ? `<a class="invoice-link" href="${escapeHtml(invoiceHost)}" target="_blank" rel="noopener noreferrer" download>打开 / 下载发票</a>` : missing}</strong>
-    </div>
-    ${info.warnings?.length ? `<div class="subscription-warning">${escapeHtml(info.warnings.join('；'))}</div>` : ''}
-  `;
 }
 
 function renderJob(job) {
@@ -393,23 +292,6 @@ function renderJob(job) {
   if (hasResults) {
     copyButton.dataset.sessions = job.sessions.join('\n');
   }
-}
-
-async function request(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-  });
-  const data = await response.json().catch(() => ({}));
-  if (response.status === 401) {
-    window.location.replace('/login');
-    throw new Error('登录已过期，正在跳转登录页');
-  }
-  if (!response.ok) {
-    const message = data.error || data.errors?.map((item) => `第 ${item.line || '?'} 行：${item.message}`).join('；') || '请求失败';
-    throw new Error(message);
-  }
-  return data;
 }
 
 function stopPolling() {
@@ -831,27 +713,6 @@ const historyState = { kind: '', q: '', page: 1, pageSize: 20, total: 0 };
 const historyDetailState = { items: [], sessions: [], filter: 'all', q: '' };
 let historySearchTimer = null;
 
-function formatResultTags(item) {
-  const counts = item.counts || {};
-  const tags = item.kind === 'check'
-    ? [['有效', counts.alive, 'success'], ['失效', counts.dead, 'failed']]
-    : [['成功', counts.success, 'success'], ['失败', counts.failed, 'failed'], ['取消', counts.cancelled, 'cancelled']];
-  const rendered = tags
-    .filter(([, value]) => value)
-    .map(([label, value, tone]) => `<span class="status-pill status-${tone}">${label} ${value}</span>`)
-    .join(' ');
-  return rendered || '<span class="status-pill status-pending">无结果</span>';
-}
-
-function formatWhen(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  const today = new Date();
-  const sameDay = date.toDateString() === today.toDateString();
-  const time = date.toLocaleTimeString('zh-CN', { hour12: false });
-  return sameDay ? `今天 ${time}` : `${date.toLocaleDateString('zh-CN')} ${time}`;
-}
-
 function renderHistoryPager() {
   const pages = Math.max(1, Math.ceil(historyState.total / historyState.pageSize));
   document.querySelector('#historyPage').textContent = `${historyState.page} / ${pages}`;
@@ -1129,23 +990,9 @@ function proxyStatusCell(check) {
   return '<span class="reason-tag reason-session">可用</span>';
 }
 
-function countProxyLines(text) {
-  return text.split(/\r?\n/).filter((line) => line.trim() && !line.trim().startsWith('#')).length;
-}
-
 function updateProxyCount() {
   const total = countProxyLines(proxies?.value || '');
   if (proxyCount) proxyCount.textContent = total ? `${total} 条代理，将随机分配` : '0 条代理，将使用直连';
-}
-
-function maskProxy(line) {
-  try {
-    const parsed = new URL(/:\/\//.test(line) ? line : `socks5://${line}`);
-    if (parsed.password) parsed.password = '***';
-    return parsed.toString();
-  } catch {
-    return line;
-  }
 }
 
 function renderProxyList() {
@@ -1172,20 +1019,6 @@ function setProxyText(text) {
 }
 
 // 粘贴的代理格式五花八门，统一成每行一条，顺手补协议并去重
-function normalizeProxyText(text) {
-  const seen = new Set();
-  const lines = [];
-  for (const raw of text.split(/[\r\n,;]+|\s{2,}/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const withScheme = /:\/\//.test(line) ? line : `socks5://${line}`;
-    if (seen.has(withScheme)) continue;
-    seen.add(withScheme);
-    lines.push(withScheme);
-  }
-  return lines.join('\n');
-}
-
 function applySettings(settings) {
   if (!proxies) return;
   proxies.value = settings.proxyText || '';
@@ -1213,6 +1046,12 @@ function applySettings(settings) {
   if (newUserRateHint && settings.apiRateLimit) {
     newUserRateHint.textContent = `不能超过每用户上限 ${settings.apiRateLimit}`;
   }
+  const sub2Root = document.querySelector('#sub2Root');
+  const sub2Port = document.querySelector('#sub2Port');
+  const sub2Enabled = document.querySelector('#sub2Enabled');
+  if (sub2Root) sub2Root.value = settings.sub2Root || '';
+  if (sub2Port && settings.sub2Port) sub2Port.value = String(settings.sub2Port);
+  if (sub2Enabled) sub2Enabled.checked = Boolean(settings.sub2Enabled);
   renderProxyList();
   const sessionNote = document.querySelector('#sessionRuntimeNote');
   const checkNote = document.querySelector('#checkRuntimeNote');
@@ -1243,6 +1082,9 @@ document.querySelector('#saveSettings')?.addEventListener('click', async () => {
         proxies: proxies.value,
         maxApiKeys: Number(document.querySelector('#maxApiKeys')?.value),
         apiRateLimit: Number(document.querySelector('#apiRateLimit')?.value),
+        sub2Root: document.querySelector('#sub2Root')?.value || '',
+        sub2Port: Number(document.querySelector('#sub2Port')?.value) || 4399,
+        sub2Enabled: Boolean(document.querySelector('#sub2Enabled')?.checked),
       }),
     });
     applySettings(result.settings);
@@ -2428,3 +2270,213 @@ document.querySelector('#pwMailBtn').addEventListener('click', (event) => runToo
   newPassword: document.querySelector('#pwNew').value,
   proxy: document.querySelector('#pwProxy').value || null,
 }));
+
+// ───────── sub2api 号池（托管 toSub2） ─────────
+// 后端把 toSub2 的 HTTP 面挂在 /api/sub2/api/* 下，并注入它自己的 console token；
+// 这里只做展示和转发，不碰 token。
+const sub2State = { running: false, pollTimer: null };
+
+const sub2Labels = {
+  queued: '排队中',
+  running: '执行中',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  waiting_phone: '等待手机验证',
+  totp_setup_otp: '设置 2FA',
+  password_add: '添加密码',
+  reauthorizing: '重新授权',
+};
+
+function sub2Tone(status) {
+  if (status === 'completed') return 'success';
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'queued') return 'pending';
+  return 'running';
+}
+
+async function sub2Call(path, options = {}) {
+  return request(`/api/sub2/api${path}`, options);
+}
+
+function renderSub2Status(info) {
+  const pill = document.querySelector('#sub2StatePill');
+  const note = document.querySelector('#sub2StatusNote');
+  const startBtn = document.querySelector('#sub2Start');
+  const stopBtn = document.querySelector('#sub2Stop');
+  if (!pill || !note) return;
+
+  sub2State.running = Boolean(info?.running);
+  const ready = Boolean(info?.ready);
+  pill.textContent = ready ? '运行中' : info?.running ? '启动中' : info?.enabled ? '已停止' : '未启用';
+  pill.className = `status-pill status-${ready ? 'success' : info?.running ? 'running' : 'pending'}`;
+  note.textContent = info?.error
+    ? info.error
+    : ready
+      ? `已就绪，监听 127.0.0.1:${info.port || '—'}`
+      : '点击「启动托管」拉起 toSub2 子进程。';
+  if (startBtn) startBtn.disabled = ready || Boolean(info?.running);
+  if (stopBtn) stopBtn.disabled = !info?.running;
+
+  const foot = document.querySelector('#navFoot');
+  const footText = document.querySelector('#navFootText');
+  if (foot && footText) {
+    foot.classList.toggle('is-ok', ready);
+    foot.classList.toggle('is-warn', !ready && Boolean(info?.running));
+    footText.textContent = ready ? 'sub2api 就绪' : info?.running ? 'sub2api 启动中' : 'sub2api 未运行';
+  }
+}
+
+async function loadSub2Status() {
+  if (currentUser?.role !== 'admin') return;
+  try {
+    renderSub2Status(await request('/api/sub2/status'));
+  } catch {
+    renderSub2Status({ running: false, ready: false, error: '无法读取托管状态' });
+  }
+}
+
+async function loadSub2Jobs() {
+  if (currentUser?.role !== 'admin' || !sub2State.running) return;
+  const body = document.querySelector('#sub2Body');
+  if (!body) return;
+  try {
+    const data = await sub2Call('/jobs?page=1');
+    const jobs = data.jobs || [];
+    body.innerHTML = jobs.length
+      ? jobs.map((job) => `
+        <tr>
+          <td>${escapeHtml(job.email || '—')}</td>
+          <td class="error-cell">${escapeHtml(job.prompt || job.lastError || '—')}</td>
+          <td><span class="status-pill status-${sub2Tone(job.status)}">${escapeHtml(sub2Labels[job.status] || job.status || '—')}</span></td>
+          <td class="nowrap-cell">${escapeHtml(formatWhen(job.updatedAt))}</td>
+        </tr>`).join('')
+      : '<tr class="empty-row"><td colspan="4">还没有任务，先在上面粘贴账号并提交。</td></tr>';
+  } catch (error) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="4">读取任务失败：${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function scheduleSub2Poll() {
+  clearTimeout(sub2State.pollTimer);
+  sub2State.pollTimer = setTimeout(async () => {
+    await loadSub2Jobs();
+    scheduleSub2Poll();
+  }, 3000);
+}
+
+document.querySelector('#sub2Start')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  const errors = document.querySelector('#sub2Errors');
+  if (errors) errors.textContent = '';
+  try {
+    renderSub2Status(await request('/api/sub2/start', { method: 'POST' }));
+    showToast('已请求启动 toSub2');
+    scheduleSub2Poll();
+    void loadSub2Jobs();
+  } catch (error) {
+    if (errors) errors.textContent = error.message;
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector('#sub2Stop')?.addEventListener('click', async () => {
+  try {
+    renderSub2Status(await request('/api/sub2/stop', { method: 'POST' }));
+    showToast('已停止托管');
+    clearTimeout(sub2State.pollTimer);
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+document.querySelector('#sub2Refresh')?.addEventListener('click', () => {
+  void loadSub2Status();
+  void loadSub2Jobs();
+});
+
+document.querySelector('#sub2JobsRefresh')?.addEventListener('click', () => { void loadSub2Jobs(); });
+
+// 只数非空行：具体格式由 toSub2 自己解析，这里不做二次校验，避免两边规则打架
+document.querySelector('#sub2Accounts')?.addEventListener('input', (event) => {
+  const count = event.target.value.split(/\r?\n/).filter((line) => line.trim()).length;
+  const label = document.querySelector('#sub2ParseCount');
+  if (label) label.textContent = `${count} 条输入`;
+});
+
+document.querySelector('#sub2Submit')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const text = document.querySelector('#sub2Accounts')?.value || '';
+  const proxyUrl = document.querySelector('#sub2Proxy')?.value || '';
+  const errors = document.querySelector('#sub2Errors');
+  if (errors) errors.textContent = '';
+  if (!text.trim()) {
+    if (errors) errors.textContent = '请先粘贴账号';
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await sub2Call('/jobs/batch', {
+      method: 'POST',
+      body: JSON.stringify({ text, proxyUrl: proxyUrl || null }),
+    });
+    showToast(`已提交 ${(result.jobs || []).length} 个账号`);
+    await loadSub2Jobs();
+    scheduleSub2Poll();
+  } catch (error) {
+    if (errors) errors.textContent = error.message;
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector('#sub2CancelAll')?.addEventListener('click', async () => {
+  try {
+    await sub2Call('/jobs/cancel-all', { method: 'POST', body: '{}' });
+    showToast('已请求取消全部任务');
+    void loadSub2Jobs();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+document.querySelector('#sub2Upload')?.addEventListener('click', async () => {
+  const note = document.querySelector('#sub2UploadNote');
+  try {
+    await sub2Call('/sub2api/upload', { method: 'POST', body: '{}' });
+    if (note) note.textContent = '已提交上传请求。';
+    showToast('已提交上传');
+  } catch (error) {
+    if (note) note.textContent = `上传失败：${error.message}`;
+    showToast(error.message);
+  }
+});
+
+document.querySelector('#sub2Download')?.addEventListener('click', async () => {
+  const note = document.querySelector('#sub2UploadNote');
+  try {
+    const data = await sub2Call('/jobs/download-batch', {
+      method: 'POST',
+      body: JSON.stringify({ all: true }),
+    });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'sub2api-import-oauth.json';
+    anchor.click();
+    URL.revokeObjectURL(url);
+    if (note) note.textContent = '已下载导入文件，请妥善保管。';
+  } catch (error) {
+    if (note) note.textContent = `下载失败：${error.message}`;
+    showToast(error.message);
+  }
+});
+
+// 管理员登录后拉一次状态，顺带点亮侧栏脚注
+setTimeout(() => { void loadSub2Status(); }, 600);
