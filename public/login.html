@@ -10,42 +10,30 @@
   <script src="/theme.js?v=2"></script>
 </head>
 <body class="login-page">
+  <button class="theme-toggle login-theme-toggle" id="themeToggle" type="button" aria-label="切换白天/夜间外观">
+    <svg class="icon-sun" aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.4M12 19v2.4M4.2 12H1.8M22.2 12h-2.4M6.3 6.3 4.6 4.6M19.4 19.4l-1.7-1.7M17.7 6.3l1.7-1.7M4.6 19.4l1.7-1.7"/></svg>
+    <svg class="icon-moon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4a8.4 8.4 0 1 0 10.2 10.2Z"/></svg>
+    <span id="themeLabel">夜间</span>
+  </button>
+
   <main class="login-shell">
-    <section class="login-intro">
-      <div class="brand">
+    <section class="login-panel">
+      <div class="login-brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
           <p class="eyebrow">Account Control</p>
           <h1>ACC 工作台</h1>
         </div>
       </div>
-      <p class="login-lede">批量取 Session、验活、添加 GPT 密码、改密和 2FA，都在同一个台子上完成。</p>
-      <ul class="login-facts">
-        <li><span>取 Session</span>邮箱验证码登录，按代理池分流</li>
-        <li><span>添加密码</span>先验 Session，失效再用邮箱密码登录后补上 GPT 密码</li>
-        <li><span>批量重试</span>勾选失败账号，换代理再跑一遍</li>
-      </ul>
-    </section>
 
-    <section class="login-panel">
-      <div class="login-panel-head">
-        <div>
-          <p class="section-kicker">Sign in</p>
-          <h2>登录</h2>
-        </div>
-        <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换白天/夜间外观">
-          <svg class="icon-sun" aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.4M12 19v2.4M4.2 12H1.8M22.2 12h-2.4M6.3 6.3 4.6 4.6M19.4 19.4l-1.7-1.7M17.7 6.3l1.7-1.7M4.6 19.4l1.7-1.7"/></svg>
-          <svg class="icon-moon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4a8.4 8.4 0 1 0 10.2 10.2Z"/></svg>
-          <span id="themeLabel">夜间</span>
-        </button>
-      </div>
+      <p class="login-lede">登录后管理取 Session、验活、改密与 2FA。</p>
 
       <form id="loginForm" novalidate>
-        <label class="compact-field">
+        <label class="login-field">
           <span>用户名</span>
           <input id="loginUsername" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" required>
         </label>
-        <label class="compact-field">
+        <label class="login-field">
           <span>口令</span>
           <input id="loginPassword" type="password" autocomplete="current-password" required>
         </label>
@@ -53,7 +41,7 @@
         <p class="input-errors" id="loginError" role="alert"></p>
       </form>
 
-      <p class="login-note">账号由管理员开通，无法自助注册。忘记口令请找管理员重置。</p>
+      <p class="login-note">账号由管理员开通。连续输错会临时锁定。</p>
     </section>
   </main>
 

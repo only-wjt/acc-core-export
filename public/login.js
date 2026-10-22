@@ -35,7 +35,15 @@ form.addEventListener('submit', async (event) => {
       body: JSON.stringify({ username, password }),
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || '登录失败');
+    if (!response.ok) {
+      // 429 = 触发防爆破锁定：直接把还要等多久告诉用户，别让他反复试
+      if (response.status === 429) {
+        const seconds = Math.ceil(Number(data.retryAfterMs || 0) / 1000);
+        const wait = seconds > 60 ? `${Math.ceil(seconds / 60)} 分钟` : `${seconds} 秒`;
+        throw new Error(`尝试次数过多，请 ${wait}后再试`);
+      }
+      throw new Error(data.error || '登录失败');
+    }
     window.location.replace('/');
   } catch (error) {
     errorNode.textContent = error.message;

@@ -69,3 +69,39 @@ test('public auth paths stay reachable before login', async () => {
   assert.equal(auth.isPublicPath('/api/auth/login'), true);
   assert.equal(auth.isPublicPath('/api/jobs'), false);
 });
+
+test('repeated failures lock the account out, even with the right password', async () => {
+  const auth = createAuth({ password: 'admin-secret', adminUsername: 'admin', bindHost: '0.0.0.0', file: await tempFile() });
+  for (let i = 0; i < 5; i++) {
+    assert.equal(auth.login({ username: 'admin', password: 'wrong', ip: '10.0.0.1' }).ok, false);
+  }
+  const locked = auth.login({ username: 'admin', password: 'admin-secret', ip: '10.0.0.1' });
+  assert.equal(locked.ok, false);
+  assert.equal(locked.locked, true);
+  assert.ok(locked.retryAfterMs > 0);
+});
+
+test('failures from one source do not lock a different user out', async () => {
+  const auth = createAuth({ password: 'admin-secret', adminUsername: 'admin', bindHost: '0.0.0.0', file: await tempFile() });
+  auth.createUser({ username: 'alice', password: 'alice-pass' });
+  for (let i = 0; i < 4; i++) auth.login({ username: 'nobody', password: 'x', ip: '10.0.0.2' });
+  assert.equal(auth.login({ username: 'alice', password: 'alice-pass', ip: '10.0.0.3' }).ok, true);
+});
+
+test('a successful login clears the failure counter', async () => {
+  const auth = createAuth({ password: 'admin-secret', adminUsername: 'admin', bindHost: '0.0.0.0', file: await tempFile() });
+  for (let i = 0; i < 4; i++) auth.login({ username: 'admin', password: 'wrong', ip: '10.0.0.4' });
+  assert.equal(auth.login({ username: 'admin', password: 'admin-secret', ip: '10.0.0.4' }).ok, true);
+  // 清零后再错 4 次仍不应该锁
+  for (let i = 0; i < 4; i++) auth.login({ username: 'admin', password: 'wrong', ip: '10.0.0.4' });
+  assert.equal(auth.login({ username: 'admin', password: 'admin-secret', ip: '10.0.0.4' }).ok, true);
+});
+
+test('unknown usernames fail the same way as wrong passwords', async () => {
+  const auth = createAuth({ password: 'admin-secret', adminUsername: 'admin', bindHost: '0.0.0.0', file: await tempFile() });
+  const ghost = auth.login({ username: 'does-not-exist', password: 'x', ip: '10.0.0.5' });
+  const wrong = auth.login({ username: 'admin', password: 'x', ip: '10.0.0.5' });
+  assert.equal(ghost.ok, false);
+  assert.equal(wrong.ok, false);
+  assert.equal(ghost.error, wrong.error);
+});

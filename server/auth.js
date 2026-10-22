@@ -6,6 +6,16 @@ import { CONCURRENCY_LIMIT } from './admin-settings.js';
 const COOKIE = 'acc_session';
 const DEFAULT_TTL_MS = 12 * 60 * 60 * 1000;
 
+// 登录爆破防护。
+// IP 维度是硬锁：同一来源连续错 5 次，锁 15 分钟——攻击者换 IP 才有用，这是应该的。
+// 用户名维度只做高阈值兜底（防分布式撞库），不能设成和 IP 一样低：
+// 否则任何人拿一个用户名错 5 次，就能把真正的机主锁在门外 15 分钟。
+// 全部放在内存里——重启清零可以接受，重启本身要能进服务器。
+const MAX_LOGIN_FAILURES = 5;
+const MAX_USERNAME_FAILURES = 50;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
 function isLoopbackHost(host) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
@@ -130,6 +140,53 @@ export function createAuth({
   }
 
   const sessions = new Map();
+  // key = `u:<用户名>` 或 `ip:<来源地址>`；value = { count, firstAt, lockedUntil }
+  const loginFailures = new Map();
+
+  function failureKey(kind, value) {
+    return `${kind}:${String(value || '').trim().toLowerCase()}`;
+  }
+
+  // 到期就清掉，避免 Map 无限增长
+  function pruneFailures() {
+    const at = now();
+    for (const [key, entry] of loginFailures) {
+      if (entry.lockedUntil && entry.lockedUntil > at) continue;
+      if (at - entry.firstAt > LOGIN_WINDOW_MS) loginFailures.delete(key);
+    }
+  }
+
+  // keys 统一是 [键, 阈值] 对；锁定判断只看键，阈值在 recordFailure 里用
+  function lockRemaining(keys) {
+    const at = now();
+    let wait = 0;
+    for (const [key] of keys) {
+      const entry = loginFailures.get(key);
+      if (entry?.lockedUntil && entry.lockedUntil > at) {
+        wait = Math.max(wait, entry.lockedUntil - at);
+      }
+    }
+    return wait;
+  }
+
+  // keys 是 [键, 该键的阈值] 列表：IP 低阈值立即锁，用户名高阈值只兜底分布式撞库。
+  function recordFailure(keys) {
+    const at = now();
+    for (const [key, threshold] of keys) {
+      const entry = loginFailures.get(key) || { count: 0, firstAt: at, lockedUntil: 0 };
+      if (at - entry.firstAt > LOGIN_WINDOW_MS) {
+        entry.count = 0;
+        entry.firstAt = at;
+      }
+      entry.count += 1;
+      if (entry.count >= threshold) entry.lockedUntil = at + LOGIN_LOCK_MS;
+      loginFailures.set(key, entry);
+    }
+  }
+
+  function clearFailures(keys) {
+    for (const [key] of keys) loginFailures.delete(key);
+  }
 
   function persist() {
     mkdirSync(dirname(file), { recursive: true });
@@ -179,13 +236,41 @@ export function createAuth({
     return Boolean(currentUser(req));
   }
 
-  function login({ username, password: candidate } = {}) {
+  // 未知用户名也跑一次 scrypt，让两条路径耗时接近——
+  // 否则"用户不存在"会明显更快返回，等于把用户名列表白送出去。
+  const DUMMY_SALT = randomBytes(16);
+  const DUMMY_HASH = scryptSync('__not_a_real_password__', DUMMY_SALT, 32).toString('hex');
+
+  function login({ username, password: candidate, ip = '' } = {}) {
     if (!enabled) return { ok: true, skipped: true, user: { username: 'local', role: 'admin' } };
     const name = normalizeUsername(username) || adminName;
+    // IP 低阈值立即锁；用户名高阈值只兜底分布式撞库，不能把机主锁在门外
+    const keys = [
+      [failureKey('u', name), MAX_USERNAME_FAILURES],
+      [failureKey('ip', ip || 'unknown'), MAX_LOGIN_FAILURES],
+    ];
+
+    pruneFailures();
+    const waitMs = lockRemaining(keys);
+    if (waitMs > 0) {
+      return {
+        ok: false,
+        locked: true,
+        retryAfterMs: waitMs,
+        error: `尝试过于频繁，请 ${Math.ceil(waitMs / 60000)} 分钟后再试`,
+      };
+    }
+
     const user = users.find((entry) => entry.username === name);
-    if (!user || !verifyPassword(candidate, user.salt, user.hash)) {
+    const matched = user
+      ? verifyPassword(candidate, user.salt, user.hash)
+      : verifyPassword(candidate, DUMMY_SALT.toString('hex'), DUMMY_HASH);
+    if (!user || !matched) {
+      recordFailure(keys);
       return { ok: false, error: '用户名或口令错误' };
     }
+
+    clearFailures(keys);
     const token = randomBytes(32).toString('hex');
     sessions.set(token, { username: user.username, role: user.role, expiresAt: now() + ttlMs });
     return { ok: true, token, maxAge: Math.floor(ttlMs / 1000), user: present(user) };

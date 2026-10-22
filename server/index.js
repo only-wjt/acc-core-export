@@ -524,8 +524,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-      const result = auth.login({ username: body.username, password: body.password });
+      // 反代场景下取 X-Forwarded-For 的首个地址；直连时就是 socket 地址
+      const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+      const ip = forwarded || req.socket?.remoteAddress || '';
+      const result = auth.login({ username: body.username, password: body.password, ip });
       if (!result.ok) {
+        if (result.locked) {
+          logger.warn('登录被锁定', { ip, retryAfterMs: result.retryAfterMs });
+          const headers = securityHeaders({ 'Content-Type': 'application/json; charset=utf-8' });
+          headers['Retry-After'] = String(Math.ceil(result.retryAfterMs / 1000));
+          res.writeHead(429, headers);
+          res.end(JSON.stringify({ error: result.error, retryAfterMs: result.retryAfterMs }));
+          return;
+        }
+        logger.warn('登录失败', { ip, username: String(body?.username || '').slice(0, 64) });
         json(res, 401, { error: result.error });
         return;
       }
