@@ -18,6 +18,7 @@ import { authorizeCodexAccount } from '../src/codex-oauth.js';
 import { getOpenApiDocs } from './openapi-spec.js';
 import { createProxyChecker } from '../src/proxy-check.js';
 import { parseProxyPool } from './batch-session.js';
+import { createLogger, summarizeJob } from './logger.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT) || 3780;
@@ -37,23 +38,33 @@ const apiKeys = createApiKeys({
   getUserRateLimit: (username) => auth.rateLimitFor(username),
 });
 const proxyChecker = createProxyChecker();
+const logger = createLogger();
 const jobOwners = new Map();
+
+// 任务结束时先打一条结构化摘要（失败原因分类 → 降载信号），再落盘。
+function recordJob(kind, job) {
+  const summary = summarizeJob(kind, job);
+  const skewed = (summary.categories.proxy || 0) + (summary.categories.region || 0) + (summary.categories.risk || 0);
+  const level = summary.failed > 0 && skewed >= Math.max(1, Math.ceil(summary.failed / 2)) ? 'warn' : 'info';
+  logger[level](`批量任务完成 ${kind}`, summary);
+  return store.saveJob(kind, job, { owner: jobOwners.get(job.id) || 'local' });
+}
 const manager = createBatchManager({
   login: gpt.login,
   waitForOTP: mail.waitForOTP,
   getAccessToken: gpt.getAccessToken,
   getSubscriptionInfo,
   cancelRenewal,
-  onFinish: (job) => store.saveJob('session', job, { owner: jobOwners.get(job.id) || 'local' }),
+  onFinish: (job) => recordJob('session', job),
 });
 const checkManager = createCheckManager({
   checkAlive: gpt.checkAlive,
-  onFinish: (job) => store.saveJob('check', job, { owner: jobOwners.get(job.id) || 'local' }),
+  onFinish: (job) => recordJob('check', job),
 });
 const passwordManager = createPasswordManager({
   addPassword: gpt.addPassword,
   waitForOTP: mail.waitForOTP,
-  onFinish: (job) => store.saveJob('password', job, { owner: jobOwners.get(job.id) || 'local' }),
+  onFinish: (job) => recordJob('password', job),
 });
 const openApi = createOpenApi({
   apiKeys,
@@ -249,6 +260,205 @@ function handleJobRoutes(kind, req, url, res, body) {
   return false;
 }
 
+// 用户管理：管理员增删改查用户，以及任意登录用户查看/更新自己（/api/me）。
+function handleUserRoutes(req, url, res, body) {
+  if (req.method === 'GET' && url.pathname === '/api/users') {
+    if (auth.currentUser(req)?.role !== 'admin') {
+      json(res, 403, { error: '仅管理员可查看用户' });
+      return true;
+    }
+    json(res, 200, {
+      users: auth.listUsers(),
+      concurrencyLimit: auth.concurrencyLimit,
+      rateLimitCeiling: adminSettings.get().apiRateLimit,
+    });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/users') {
+    if (auth.currentUser(req)?.role !== 'admin') {
+      json(res, 403, { error: '仅管理员可创建用户' });
+      return true;
+    }
+    const result = auth.createUser(body);
+    json(res, result.ok ? 201 : 400, result.ok ? result.user : { error: result.error });
+    return true;
+  }
+
+  const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
+  if (userMatch && req.method === 'PUT') {
+    if (auth.currentUser(req)?.role !== 'admin') {
+      json(res, 403, { error: '仅管理员可修改用户' });
+      return true;
+    }
+    const result = auth.updateUser(decodeURIComponent(userMatch[1]), {
+      concurrency: body?.concurrency,
+      apiRateLimit: body?.apiRateLimit,
+    });
+    json(res, result.ok ? 200 : 400, result.ok ? result.user : { error: result.error });
+    return true;
+  }
+
+  if (userMatch && req.method === 'DELETE') {
+    const actor = auth.currentUser(req);
+    if (actor?.role !== 'admin') {
+      json(res, 403, { error: '仅管理员可删除用户' });
+      return true;
+    }
+    const result = auth.deleteUser(decodeURIComponent(userMatch[1]), actor.username);
+    json(res, result.ok ? 200 : 400, result.ok ? { ok: true } : { error: result.error });
+    return true;
+  }
+
+  if (url.pathname === '/api/me' && (req.method === 'GET' || req.method === 'PUT')) {
+    const actor = auth.currentUser(req);
+    if (!actor) {
+      json(res, 401, { error: '请先登录' });
+      return true;
+    }
+    if (req.method === 'GET') {
+      json(res, 200, { user: actor, rateLimitCeiling: adminSettings.get().apiRateLimit });
+      return true;
+    }
+    const result = auth.updateUser(actor.username, { apiRateLimit: body?.apiRateLimit });
+    json(res, result.ok ? 200 : 400, result.ok
+      ? { user: result.user, rateLimitCeiling: adminSettings.get().apiRateLimit }
+      : { error: result.error });
+    return true;
+  }
+
+  return false;
+}
+
+// 单账号即时操作：TOTP、邮箱收信/取码/找链接、2FA 增删、改密。
+// 都在全局鉴权之后、属于已登录用户的即时调用，逻辑与各端点一一对应。
+async function handleAccountOps(req, url, res, body) {
+  if (req.method !== 'POST') return false;
+
+  if (url.pathname === '/api/totp') {
+    try {
+      const code = gpt.totpCode(body.totpSecret);
+      const remainingMs = 30000 - (Date.now() % 30000);
+      json(res, 200, { code, remainingMs });
+    } catch (error) {
+      json(res, 400, { error: publicError(error) });
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/mail/list') {
+    if (!body.email || !body.password) {
+      json(res, 400, { error: '请填写邮箱和密码' });
+      return true;
+    }
+    const result = await mail.listMail(body.email, body.password, { proxy: body.proxy || null, size: 30 });
+    json(res, 200, result);
+    return true;
+  }
+
+  if (url.pathname === '/api/mail/otp') {
+    if (!body.email || !body.password) {
+      json(res, 400, { error: '请填写邮箱和密码' });
+      return true;
+    }
+    const found = body.wait
+      ? { code: await mail.waitForOTP(body.email, body.password, { proxy: body.proxy || null, maxMs: 60000 }) }
+      : await mail.findOTP(body.email, body.password, { proxy: body.proxy || null });
+    json(res, 200, found || { code: null });
+    return true;
+  }
+
+  if (url.pathname === '/api/mail/link') {
+    if (!body.email || !body.password || !body.pattern) {
+      json(res, 400, { error: '请填写邮箱、密码和链接匹配规则' });
+      return true;
+    }
+    const found = await mail.findLink(body.email, body.password, {
+      pattern: body.pattern,
+      proxy: body.proxy || null,
+    });
+    json(res, 200, found || { link: null });
+    return true;
+  }
+
+  if (url.pathname === '/api/mfa/enable') {
+    const result = await gpt.enableMfa(
+      { email: body.email, gptPassword: body.gptPassword, sessionToken: body.sessionToken },
+      {
+        password: body.gptPassword,
+        totpSecret: body.totpSecret || null,
+        getOtp: body.mailPassword
+          ? () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 })
+          : undefined,
+        proxy: body.proxy || null,
+      },
+    );
+    json(res, 200, { ok: true, totpSecret: result.totpSecret || result.secret || null, message: result.message || '已开启 2FA' });
+    return true;
+  }
+
+  if (url.pathname === '/api/mfa/disable') {
+    const result = await gpt.disableMfa(
+      { email: body.email, gptPassword: body.gptPassword, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
+      { password: body.gptPassword, totpSecret: body.totpSecret, proxy: body.proxy || null },
+    );
+    json(res, 200, { ok: true, alreadyDisabled: result.alreadyDisabled || false, message: result.message || '已关闭 2FA' });
+    return true;
+  }
+
+  if (url.pathname === '/api/password/gpt') {
+    const getOtp = body.mailPassword
+      ? () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 })
+      : undefined;
+    const result = await gpt.changePassword(
+      { email: body.email, gptPassword: body.gptPassword, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
+      {
+        currentPassword: body.gptPassword,
+        newPassword: body.newPassword,
+        totpSecret: body.totpSecret || null,
+        getOtp,
+        proxy: body.proxy || null,
+      },
+    );
+    json(res, 200, { ok: Boolean(result?.ok), message: 'GPT 密码已修改' });
+    return true;
+  }
+
+  if (url.pathname === '/api/password/gpt-add') {
+    if (!body.email || !body.mailPassword) {
+      json(res, 400, { error: '请填写邮箱和邮箱密码' });
+      return true;
+    }
+    const newPassword = body.newPassword
+      ? gpt.assertGptPassword(body.newPassword)
+      : gpt.generateGptPassword();
+    const result = await gpt.addPassword(
+      { email: body.email, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
+      {
+        newPassword,
+        totpSecret: body.totpSecret || null,
+        getOtp: () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 }),
+        proxy: body.proxy || null,
+      },
+    );
+    json(res, 200, {
+      ok: Boolean(result?.ok),
+      newPassword: result.newPassword || newPassword,
+      line: `${body.email}----${result.newPassword || newPassword}----${body.mailPassword}`,
+      message: '已添加 GPT 密码',
+    });
+    return true;
+  }
+
+  if (url.pathname === '/api/password/mail') {
+    await mail.changePassword(body.email, body.password, body.newPassword, body.proxy || null);
+    json(res, 200, { ok: true, message: '邮箱密码已修改' });
+    return true;
+  }
+
+  return false;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
   const isOpenApi = url.pathname.startsWith('/openapi/');
@@ -397,70 +607,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/users') {
-      if (auth.currentUser(req)?.role !== 'admin') {
-        json(res, 403, { error: '仅管理员可查看用户' });
-        return;
-      }
-      json(res, 200, {
-        users: auth.listUsers(),
-        concurrencyLimit: auth.concurrencyLimit,
-        rateLimitCeiling: adminSettings.get().apiRateLimit,
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/users') {
-      if (auth.currentUser(req)?.role !== 'admin') {
-        json(res, 403, { error: '仅管理员可创建用户' });
-        return;
-      }
-      const result = auth.createUser(body);
-      json(res, result.ok ? 201 : 400, result.ok ? result.user : { error: result.error });
-      return;
-    }
-
-    const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
-    if (userMatch && req.method === 'PUT') {
-      if (auth.currentUser(req)?.role !== 'admin') {
-        json(res, 403, { error: '仅管理员可修改用户' });
-        return;
-      }
-      const result = auth.updateUser(decodeURIComponent(userMatch[1]), {
-        concurrency: body?.concurrency,
-        apiRateLimit: body?.apiRateLimit,
-      });
-      json(res, result.ok ? 200 : 400, result.ok ? result.user : { error: result.error });
-      return;
-    }
-
-    if (userMatch && req.method === 'DELETE') {
-      const actor = auth.currentUser(req);
-      if (actor?.role !== 'admin') {
-        json(res, 403, { error: '仅管理员可删除用户' });
-        return;
-      }
-      const result = auth.deleteUser(decodeURIComponent(userMatch[1]), actor.username);
-      json(res, result.ok ? 200 : 400, result.ok ? { ok: true } : { error: result.error });
-      return;
-    }
-
-    if (url.pathname === '/api/me' && (req.method === 'GET' || req.method === 'PUT')) {
-      const actor = auth.currentUser(req);
-      if (!actor) {
-        json(res, 401, { error: '请先登录' });
-        return;
-      }
-      if (req.method === 'GET') {
-        json(res, 200, { user: actor, rateLimitCeiling: adminSettings.get().apiRateLimit });
-        return;
-      }
-      const result = auth.updateUser(actor.username, { apiRateLimit: body?.apiRateLimit });
-      json(res, result.ok ? 200 : 400, result.ok
-        ? { user: result.user, rateLimitCeiling: adminSettings.get().apiRateLimit }
-        : { error: result.error });
-      return;
-    }
+    if (handleUserRoutes(req, url, res, body)) return;
 
     if (req.method === 'GET' && url.pathname === '/api/openapi/docs') {
       json(res, 200, getOpenApiDocs(apiKeys.limits()));
@@ -506,126 +653,7 @@ const server = http.createServer(async (req, res) => {
     if (handleJobRoutes('check', req, url, res, body)) return;
     if (handleJobRoutes('password', req, url, res, body)) return;
 
-    if (req.method === 'POST' && url.pathname === '/api/totp') {
-      try {
-        const code = gpt.totpCode(body.totpSecret);
-        const remainingMs = 30000 - (Date.now() % 30000);
-        json(res, 200, { code, remainingMs });
-      } catch (error) {
-        json(res, 400, { error: publicError(error) });
-      }
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/mail/list') {
-      if (!body.email || !body.password) {
-        json(res, 400, { error: '请填写邮箱和密码' });
-        return;
-      }
-      const result = await mail.listMail(body.email, body.password, { proxy: body.proxy || null, size: 30 });
-      json(res, 200, result);
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/mail/otp') {
-      if (!body.email || !body.password) {
-        json(res, 400, { error: '请填写邮箱和密码' });
-        return;
-      }
-      const found = body.wait
-        ? { code: await mail.waitForOTP(body.email, body.password, { proxy: body.proxy || null, maxMs: 60000 }) }
-        : await mail.findOTP(body.email, body.password, { proxy: body.proxy || null });
-      json(res, 200, found || { code: null });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/mail/link') {
-      if (!body.email || !body.password || !body.pattern) {
-        json(res, 400, { error: '请填写邮箱、密码和链接匹配规则' });
-        return;
-      }
-      const found = await mail.findLink(body.email, body.password, {
-        pattern: body.pattern,
-        proxy: body.proxy || null,
-      });
-      json(res, 200, found || { link: null });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/mfa/enable') {
-      const result = await gpt.enableMfa(
-        { email: body.email, gptPassword: body.gptPassword, sessionToken: body.sessionToken },
-        {
-          password: body.gptPassword,
-          totpSecret: body.totpSecret || null,
-          getOtp: body.mailPassword
-            ? () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 })
-            : undefined,
-          proxy: body.proxy || null,
-        },
-      );
-      json(res, 200, { ok: true, totpSecret: result.totpSecret || result.secret || null, message: result.message || '已开启 2FA' });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/mfa/disable') {
-      const result = await gpt.disableMfa(
-        { email: body.email, gptPassword: body.gptPassword, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
-        { password: body.gptPassword, totpSecret: body.totpSecret, proxy: body.proxy || null },
-      );
-      json(res, 200, { ok: true, alreadyDisabled: result.alreadyDisabled || false, message: result.message || '已关闭 2FA' });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/password/gpt') {
-      const getOtp = body.mailPassword
-        ? () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 })
-        : undefined;
-      const result = await gpt.changePassword(
-        { email: body.email, gptPassword: body.gptPassword, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
-        {
-          currentPassword: body.gptPassword,
-          newPassword: body.newPassword,
-          totpSecret: body.totpSecret || null,
-          getOtp,
-          proxy: body.proxy || null,
-        },
-      );
-      json(res, 200, { ok: Boolean(result?.ok), message: 'GPT 密码已修改' });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/password/gpt-add') {
-      if (!body.email || !body.mailPassword) {
-        json(res, 400, { error: '请填写邮箱和邮箱密码' });
-        return;
-      }
-      const newPassword = body.newPassword
-        ? gpt.assertGptPassword(body.newPassword)
-        : gpt.generateGptPassword();
-      const result = await gpt.addPassword(
-        { email: body.email, totpSecret: body.totpSecret, sessionToken: body.sessionToken },
-        {
-          newPassword,
-          totpSecret: body.totpSecret || null,
-          getOtp: () => mail.waitForOTP(body.email, body.mailPassword, { proxy: body.proxy || null, maxMs: 180000 }),
-          proxy: body.proxy || null,
-        },
-      );
-      json(res, 200, {
-        ok: Boolean(result?.ok),
-        newPassword: result.newPassword || newPassword,
-        line: `${body.email}----${result.newPassword || newPassword}----${body.mailPassword}`,
-        message: '已添加 GPT 密码',
-      });
-      return;
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/password/mail') {
-      await mail.changePassword(body.email, body.password, body.newPassword, body.proxy || null);
-      json(res, 200, { ok: true, message: '邮箱密码已修改' });
-      return;
-    }
+    if (await handleAccountOps(req, url, res, body)) return;
 
     if (url.pathname.startsWith('/api/')) {
       json(res, 404, { error: '接口不存在' });
@@ -662,7 +690,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   const authHint = auth.enabled ? '已启用口令登录' : '本机模式，未启用口令';
   const persistHint = store.enabled ? `结果目录 ${store.dir}` : '不落盘';
-  console.log(`Session 工作台已启动：http://${HOST}:${PORT}（${authHint}；${persistHint}）`);
+  logger.info(`Session 工作台已启动：http://${HOST}:${PORT}（${authHint}；${persistHint}）`);
 });
 
 let closing = false;
