@@ -821,6 +821,7 @@ tbody tr:has(input[type="checkbox"]:checked):hover td { background: var(--brass-
 }
 .status-pending { color: var(--muted); background: var(--raised); }
 .status-running { color: var(--info); background: var(--info-soft); }
+.status-interrupted { color: var(--warn); background: var(--warn-soft); }
 .status-success { color: var(--go); background: var(--go-soft); }
 .status-failed { color: var(--stop); background: var(--stop-soft); }
 .status-cancelled { color: var(--warn); background: var(--warn-soft); }

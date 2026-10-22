@@ -474,6 +474,14 @@ export function createPasswordManager({
     return job ? serializeJob(job) : null;
   }
 
+  // 供定时快照使用：只返回仍在跑的任务，序列化后立刻脱离内部可变对象。
+  function listRunning() {
+    cleanup();
+    return [...jobs.values()]
+      .filter((job) => job.status === 'running')
+      .map(serializeJob);
+  }
+
   function cancel(id) {
     const job = jobs.get(id);
     if (!job) return null;

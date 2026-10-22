@@ -19,6 +19,7 @@ import { getOpenApiDocs } from './openapi-spec.js';
 import { createProxyChecker } from '../src/proxy-check.js';
 import { parseProxyPool } from './batch-session.js';
 import { createLogger, summarizeJob } from './logger.js';
+import { createRuntimeKeeper } from './runtime-snapshot.js';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT) || 3780;
@@ -47,6 +48,7 @@ function recordJob(kind, job) {
   const skewed = (summary.categories.proxy || 0) + (summary.categories.region || 0) + (summary.categories.risk || 0);
   const level = summary.failed > 0 && skewed >= Math.max(1, Math.ceil(summary.failed / 2)) ? 'warn' : 'info';
   logger[level](`批量任务完成 ${kind}`, summary);
+  void store.clearRuntime(kind, job.id).catch(() => {});
   return store.saveJob(kind, job, { owner: jobOwners.get(job.id) || 'local' });
 }
 const manager = createBatchManager({
@@ -76,6 +78,14 @@ const openApi = createOpenApi({
   gpt,
   mail,
   authorizeCodex: authorizeCodexAccount,
+});
+
+// 运行中任务快照与重启恢复，见 server/runtime-snapshot.js
+const runtimeKeeper = createRuntimeKeeper({
+  store,
+  managers: { session: manager, check: checkManager, password: passwordManager },
+  jobOwners,
+  logger,
 });
 
 const contentTypes = {
@@ -691,12 +701,19 @@ server.listen(PORT, HOST, () => {
   const authHint = auth.enabled ? '已启用口令登录' : '本机模式，未启用口令';
   const persistHint = store.enabled ? `结果目录 ${store.dir}` : '不落盘';
   logger.info(`Session 工作台已启动：http://${HOST}:${PORT}（${authHint}；${persistHint}）`);
+
+  // 先把上次遗留的快照归档，再开始定时写新的。
+  void runtimeKeeper.recover().catch((error) => logger.error('恢复中断任务失败', { error: String(error?.message || error) }));
+  runtimeKeeper.start();
 });
 
 let closing = false;
 async function close() {
   if (closing) return;
   closing = true;
+  runtimeKeeper.stop();
+  // 退出前再存一次，尽量留住正在跑的进度
+  await runtimeKeeper.snapshotRunning().catch(() => {});
   server.close();
   await shutdownCycleTLS().catch(() => {});
   process.exit(0);

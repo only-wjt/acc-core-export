@@ -2,6 +2,8 @@ import { mkdir, writeFile, readFile, readdir, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const ARCHIVE_RE = /^(session|check|password)-.*\.json$/;
+// 运行中任务的快照，独立前缀，不进历史列表，也不参与归档清理计数。
+const RUNTIME_RE = /^runtime-(session|check|password)-[\w-]+\.json$/;
 
 // 文件名形如 kind-2026-08-15T16-03-34-768Z-xxxxxxxx.json（ISO 时间戳里的 : 和 . 被换成了 -）。
 // 还原成毫秒，供按天清理用；解析失败返回 null，不影响按数量清理。
@@ -67,14 +69,72 @@ export function createStore({
       items: (job.items || []).map((item) => ({
         email: item.email,
         status: item.status,
+        stage: item.stage || '',
         plan: item.plan || item.subscriptionInfo?.plan || '',
         error: item.error || '',
+        errorCategory: item.errorCategory || '',
         reason: item.reason || '',
       })),
     };
     await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
     await prune().catch(() => {});
     return file;
+  }
+
+  // ───────── 运行中任务快照 ─────────
+  // 只存"跑到哪了"，不存密码、不存 session：重启后能告诉操作者哪些账号断了、
+  // 断在哪一步，但不具备自动续跑的条件（续跑需要凭据，而凭据本来就不落盘）。
+  function runtimeFile(kind, id) {
+    return resolve(root, `runtime-${kind}-${id}.json`);
+  }
+
+  async function saveRuntime(kind, job, { owner = 'local' } = {}) {
+    if (!enabled || !job?.id) return null;
+    await ensure();
+    const payload = {
+      kind,
+      id: job.id,
+      owner,
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: now(),
+      concurrency: job.concurrency,
+      proxyCount: job.proxyCount || 0,
+      counts: job.counts,
+      items: (job.items || []).map((item) => ({
+        index: item.index,
+        email: item.email,
+        status: item.status,
+        stage: item.stage || '',
+        error: item.error || '',
+        errorCategory: item.errorCategory || '',
+        retryCount: item.retryCount || 0,
+        startedAt: item.startedAt || null,
+      })),
+    };
+    await writeFile(runtimeFile(kind, job.id), `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    return job.id;
+  }
+
+  async function clearRuntime(kind, id) {
+    if (!enabled || !id) return;
+    await unlink(runtimeFile(kind, id)).catch(() => {});
+  }
+
+  // 启动时扫描遗留快照 = 上次进程没跑完的任务。
+  async function loadRuntimes() {
+    if (!enabled) return [];
+    await ensure();
+    const names = (await readdir(root).catch(() => [])).filter((name) => RUNTIME_RE.test(name));
+    const rows = [];
+    for (const name of names) {
+      try {
+        rows.push(JSON.parse(await readFile(resolve(root, name), 'utf8')));
+      } catch {
+        await unlink(resolve(root, name)).catch(() => {});
+      }
+    }
+    return rows;
   }
 
   async function listRecent(limit = 20, { owner, isAdmin = false } = {}) {
@@ -172,5 +232,8 @@ export function createStore({
     }
   }
 
-  return { enabled, dir: root, saveJob, listRecent, search, readJob, prune };
+  return {
+    enabled, dir: root, saveJob, listRecent, search, readJob, prune,
+    saveRuntime, clearRuntime, loadRuntimes,
+  };
 }
